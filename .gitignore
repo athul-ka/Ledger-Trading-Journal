@@ -1,0 +1,35 @@
+# Build output
+/build/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Application local data
+*.db
+*.sqlite
+*.sqlite3
+
+# Binaries
+TradingJournal
+*.o
+*.obj
+*.so
+*.a
+*.out
+
+# Qt generated files
+*_autogen/
+*.moc
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+
+# Editor and OS files
+*.swp
+*.swo
+*~
+.DS_Store
