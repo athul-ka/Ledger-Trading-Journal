@@ -1,0 +1,37 @@
+[
+{
+  "directory": "/home/machine/Ledger/build",
+  "command": "/usr/bin/c++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_SQL_LIB -DQT_WIDGETS_LIB -I/home/machine/Ledger/build/Ledger_autogen/include -I/home/machine/Ledger/core -I/home/machine/Ledger/ui -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtSql -fPIC -o CMakeFiles/Ledger.dir/Ledger_autogen/mocs_compilation.cpp.o -c /home/machine/Ledger/build/Ledger_autogen/mocs_compilation.cpp",
+  "file": "/home/machine/Ledger/build/Ledger_autogen/mocs_compilation.cpp"
+},
+{
+  "directory": "/home/machine/Ledger/build",
+  "command": "/usr/bin/c++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_SQL_LIB -DQT_WIDGETS_LIB -I/home/machine/Ledger/build/Ledger_autogen/include -I/home/machine/Ledger/core -I/home/machine/Ledger/ui -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtSql -fPIC -o CMakeFiles/Ledger.dir/main.cpp.o -c /home/machine/Ledger/main.cpp",
+  "file": "/home/machine/Ledger/main.cpp"
+},
+{
+  "directory": "/home/machine/Ledger/build",
+  "command": "/usr/bin/c++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_SQL_LIB -DQT_WIDGETS_LIB -I/home/machine/Ledger/build/Ledger_autogen/include -I/home/machine/Ledger/core -I/home/machine/Ledger/ui -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtSql -fPIC -o CMakeFiles/Ledger.dir/core/database.cpp.o -c /home/machine/Ledger/core/database.cpp",
+  "file": "/home/machine/Ledger/core/database.cpp"
+},
+{
+  "directory": "/home/machine/Ledger/build",
+  "command": "/usr/bin/c++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_SQL_LIB -DQT_WIDGETS_LIB -I/home/machine/Ledger/build/Ledger_autogen/include -I/home/machine/Ledger/core -I/home/machine/Ledger/ui -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtSql -fPIC -o CMakeFiles/Ledger.dir/core/trade.cpp.o -c /home/machine/Ledger/core/trade.cpp",
+  "file": "/home/machine/Ledger/core/trade.cpp"
+},
+{
+  "directory": "/home/machine/Ledger/build",
+  "command": "/usr/bin/c++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_SQL_LIB -DQT_WIDGETS_LIB -I/home/machine/Ledger/build/Ledger_autogen/include -I/home/machine/Ledger/core -I/home/machine/Ledger/ui -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtSql -fPIC -o CMakeFiles/Ledger.dir/core/stats.cpp.o -c /home/machine/Ledger/core/stats.cpp",
+  "file": "/home/machine/Ledger/core/stats.cpp"
+},
+{
+  "directory": "/home/machine/Ledger/build",
+  "command": "/usr/bin/c++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_SQL_LIB -DQT_WIDGETS_LIB -I/home/machine/Ledger/build/Ledger_autogen/include -I/home/machine/Ledger/core -I/home/machine/Ledger/ui -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtSql -fPIC -o CMakeFiles/Ledger.dir/ui/mainwindow.cpp.o -c /home/machine/Ledger/ui/mainwindow.cpp",
+  "file": "/home/machine/Ledger/ui/mainwindow.cpp"
+},
+{
+  "directory": "/home/machine/Ledger/build",
+  "command": "/usr/bin/c++ -DQT_CORE_LIB -DQT_GUI_LIB -DQT_NO_DEBUG -DQT_SQL_LIB -DQT_WIDGETS_LIB -I/home/machine/Ledger/build/Ledger_autogen/include -I/home/machine/Ledger/core -I/home/machine/Ledger/ui -isystem /usr/include/x86_64-linux-gnu/qt6/QtWidgets -isystem /usr/include/x86_64-linux-gnu/qt6 -isystem /usr/include/x86_64-linux-gnu/qt6/QtCore -isystem /usr/lib/x86_64-linux-gnu/qt6/mkspecs/linux-g++ -isystem /usr/include/x86_64-linux-gnu/qt6/QtGui -isystem /usr/include/x86_64-linux-gnu/qt6/QtSql -fPIC -o CMakeFiles/Ledger.dir/ui/addtradedialog.cpp.o -c /home/machine/Ledger/ui/addtradedialog.cpp",
+  "file": "/home/machine/Ledger/ui/addtradedialog.cpp"
+}
+]

@@ -1,0 +1,4 @@
+/home/machine/Ledger/build/CMakeFiles/Ledger.dir
+/home/machine/Ledger/build/CMakeFiles/edit_cache.dir
+/home/machine/Ledger/build/CMakeFiles/rebuild_cache.dir
+/home/machine/Ledger/build/CMakeFiles/Ledger_autogen.dir
