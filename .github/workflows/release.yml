@@ -42,7 +42,15 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path deploy
-          Copy-Item build\Release\Ledger.exe deploy\
+          if (Test-Path "build\Release\Ledger.exe") {
+            $exePath = "build\Release\Ledger.exe"
+          } elseif (Test-Path "build\Ledger.exe") {
+            $exePath = "build\Ledger.exe"
+          } else {
+            throw "Ledger.exe not found in build\\Release or build"
+          }
+
+          Copy-Item $exePath deploy\Ledger.exe
           windeployqt --release --no-translations --no-system-d3d-compiler `
             --no-opengl-sw deploy\Ledger.exe
 

@@ -52,8 +52,11 @@ void Updater::onCheckFinished()
     QJsonDocument doc  = QJsonDocument::fromJson(m_checkReply->readAll());
     QJsonObject   root = doc.object();
     m_latestVersion    = root["tag_name"].toString(); // e.g. "v1.2.0"
+    m_downloadUrl.clear();
 
-    QString current = QString("v") + APP_VERSION;
+    QString current = QString::fromUtf8(APP_VERSION);
+    if (!current.startsWith("v"))
+        current.prepend("v");
 
     if (m_latestVersion.isEmpty() || m_latestVersion == current) {
         QMessageBox::information(m_parent, "Up to Date",
