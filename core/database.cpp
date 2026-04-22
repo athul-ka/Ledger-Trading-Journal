@@ -1,5 +1,6 @@
 #include "database.h"
 #include <QtSql/QSqlQuery>
+#include <QtSql/QSqlError>
 #include <QtSql/QSqlRecord>
 #include <QDir>
 #include <QDebug>
@@ -10,6 +11,7 @@ void ensureColumnExists(QSqlDatabase &db, const QString &columnName, const QStri
 {
     QSqlQuery infoQuery(db);
     if (!infoQuery.exec("PRAGMA table_info(trades)")) {
+        qWarning() << "Failed to inspect trades schema:" << infoQuery.lastError().text();
         return;
     }
 
@@ -20,7 +22,9 @@ void ensureColumnExists(QSqlDatabase &db, const QString &columnName, const QStri
     }
 
     QSqlQuery alterQuery(db);
-    alterQuery.exec(QString("ALTER TABLE trades ADD COLUMN %1 %2").arg(columnName, definition));
+    if (!alterQuery.exec(QString("ALTER TABLE trades ADD COLUMN %1 %2").arg(columnName, definition))) {
+        qWarning() << "Failed to add column" << columnName << ":" << alterQuery.lastError().text();
+    }
 }
 
 }
@@ -34,12 +38,15 @@ Database::Database() {}
 
 bool Database::connect() {
     db = QSqlDatabase::addDatabase("QSQLITE");
-    db.setDatabaseName("trades.db");
+    db.setDatabaseName("ledger.db");
 
-    if (!db.open()) return false;
+    if (!db.open()) {
+        qWarning() << "Failed to open database:" << db.lastError().text();
+        return false;
+    }
 
-    QSqlQuery query;
-    query.exec(R"(
+    QSqlQuery query(db);
+    if (!query.exec(R"(
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             date TEXT,
@@ -60,7 +67,10 @@ bool Database::connect() {
             screenshot TEXT,
             notes TEXT
         )
-    )");
+    )")) {
+        qWarning() << "Failed to create or verify trades table:" << query.lastError().text();
+        return false;
+    }
 
     ensureColumnExists(db, "lot_size", "REAL");
     ensureColumnExists(db, "account", "TEXT");

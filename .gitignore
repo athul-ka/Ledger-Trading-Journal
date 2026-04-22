@@ -14,7 +14,7 @@ compile_commands.json
 *.sqlite3
 
 # Binaries
-TradingJournal
+Ledger
 *.o
 *.obj
 *.so

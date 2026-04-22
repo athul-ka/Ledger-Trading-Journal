@@ -1,7 +1,10 @@
 #pragma once
 #include <QMainWindow>
 #include <QDate>
+#include "theme.h"
+#include "updater.h"
 
+class QButtonGroup;
 class QComboBox;
 class QLabel;
 class QLineEdit;
@@ -28,9 +31,13 @@ private:
     void setupUI();
     void setupTradeTable();
     void setupCalendarView();
+    void setupAccountsView();
+    void setupSettingsView();
+    void applyTheme(Theme::ThemeId id);
     void loadStats();
     void refreshTrades();
     void refreshCalendarView();
+    void refreshAccountsView();
     void loadSelectedDaySummary();
     void changeCalendarMonth(int monthOffset);
     void setCalendarYear(int year);
@@ -50,16 +57,21 @@ private:
     QLabel *calendarMonthLabel = nullptr;
     QLineEdit *searchEdit = nullptr;
     QComboBox *sessionFilterCombo = nullptr;
+    QComboBox *setupFilterCombo = nullptr;
     QComboBox *resultFilterCombo = nullptr;
+    QComboBox *accountSelectorCombo = nullptr;
     QComboBox *calendarYearCombo = nullptr;
     QTableWidget *calendarTable = nullptr;
+    QTableWidget *accountTradesTable = nullptr;
     QTabWidget *viewTabs = nullptr;
     QTableView *tradeTable = nullptr;
+    QLabel *accountStatsLabel = nullptr;
     QSqlTableModel *tradeModel = nullptr;
     QSortFilterProxyModel *tradeProxyModel = nullptr;
     QPushButton *editButton = nullptr;
     QPushButton *deleteButton = nullptr;
     QPushButton *exportButton = nullptr;
-    QDate currentCalendarMonth;
+    QButtonGroup *themeButtonGroup = nullptr;
+    Theme::ThemeId currentThemeId = Theme::Bloomberg;    Updater        m_updater;    QDate currentCalendarMonth;
     QDate selectedCalendarDate;
 };

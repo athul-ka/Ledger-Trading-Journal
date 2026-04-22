@@ -1,9 +1,12 @@
 #include "mainwindow.h"
 #include "database.h"
-#include "stats.h"
 #include "addtradedialog.h"
+#include "constants.h"
+#include "theme.h"
 
 #include <QAbstractItemView>
+#include <QApplication>
+#include <QButtonGroup>
 #include <QColor>
 #include <QDate>
 #include <QDesktopServices>
@@ -23,6 +26,8 @@
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QSqlTableModel>
+#include <QRadioButton>
+#include <QSettings>
 #include <QSignalBlocker>
 #include <QTabWidget>
 #include <QTableWidget>
@@ -63,6 +68,12 @@ public:
         invalidateFilter();
     }
 
+    void setSetupFilter(const QString &value)
+    {
+        setupFilter = value.trimmed();
+        invalidateFilter();
+    }
+
 protected:
     bool filterAcceptsRow(int sourceRow, const QModelIndex &sourceParent) const override
     {
@@ -80,6 +91,10 @@ protected:
         }
 
         if (!resultFilter.isEmpty() && resultFilter != "All" && valueAt("win_loss") != resultFilter) {
+            return false;
+        }
+
+        if (!setupFilter.isEmpty() && setupFilter != "All" && valueAt("setup") != setupFilter) {
             return false;
         }
 
@@ -102,6 +117,7 @@ private:
     QString searchText;
     QString sessionFilter;
     QString resultFilter;
+    QString setupFilter;
 };
 
 QString csvEscape(const QString &value)
@@ -119,7 +135,14 @@ MainWindow::MainWindow(QWidget *parent)
     Database::instance().connect();
     currentCalendarMonth = QDate::currentDate().addDays(1 - QDate::currentDate().day());
     selectedCalendarDate = QDate::currentDate();
+
+    QSettings settings("Ledger", "Ledger");
+    currentThemeId = static_cast<Theme::ThemeId>(
+        settings.value("theme", static_cast<int>(Theme::Bloomberg)).toInt()
+    );
+
     setupUI();
+    setWindowTitle("Ledger");
 }
 
 void MainWindow::setupUI() {
@@ -131,18 +154,23 @@ void MainWindow::setupUI() {
     auto *filterLayout = new QHBoxLayout;
     auto *buttonLayout = new QHBoxLayout;
 
-    auto *title = new QLabel("Trading Journal Dashboard");
-    title->setStyleSheet("font-size:20px;font-weight:bold;");
+    auto *title = new QLabel("Ledger Dashboard");
+    title->setObjectName("PageTitle");
 
     statsLabel = new QLabel;
+    statsLabel->setObjectName("StatsCard");
     searchEdit = new QLineEdit(this);
     searchEdit->setPlaceholderText("Search all trade fields...");
     sessionFilterCombo = new QComboBox(this);
     sessionFilterCombo->addItems({"All", "London", "New York", "Asia"});
+    setupFilterCombo = new QComboBox(this);
+    setupFilterCombo->addItem("All");
+    setupFilterCombo->addItems(Domain::setupOptions());
     resultFilterCombo = new QComboBox(this);
     resultFilterCombo->addItems({"All", "Win", "Loss", "Breakeven"});
 
     auto *btnAdd = new QPushButton("Add Trade");
+    btnAdd->setObjectName("PrimaryButton");
     editButton = new QPushButton("Edit Selected");
     deleteButton = new QPushButton("Delete Selected");
     exportButton = new QPushButton("Export CSV");
@@ -152,6 +180,8 @@ void MainWindow::setupUI() {
     filterLayout->addWidget(searchEdit, 1);
     filterLayout->addWidget(new QLabel("Session", this));
     filterLayout->addWidget(sessionFilterCombo);
+    filterLayout->addWidget(new QLabel("Setup", this));
+    filterLayout->addWidget(setupFilterCombo);
     filterLayout->addWidget(new QLabel("Result", this));
     filterLayout->addWidget(resultFilterCombo);
 
@@ -169,11 +199,15 @@ void MainWindow::setupUI() {
 
     viewTabs->addTab(tradesPage, "Trades");
     setupCalendarView();
+    setupAccountsView();
+    setupSettingsView();
 
     layout->addWidget(viewTabs);
 
     setCentralWidget(central);
     resize(1440, 820);
+
+    applyTheme(currentThemeId);
 
     setupTradeTable();
 
@@ -183,6 +217,7 @@ void MainWindow::setupUI() {
     connect(exportButton, &QPushButton::clicked, this, &MainWindow::exportTradesToCsv);
     connect(searchEdit, &QLineEdit::textChanged, this, [this]() { applyFilters(); });
     connect(sessionFilterCombo, &QComboBox::currentTextChanged, this, [this]() { applyFilters(); });
+    connect(setupFilterCombo, &QComboBox::currentTextChanged, this, [this]() { applyFilters(); });
     connect(resultFilterCombo, &QComboBox::currentTextChanged, this, [this]() { applyFilters(); });
 
     refreshTrades();
@@ -197,12 +232,12 @@ void MainWindow::setupCalendarView()
     auto *calendarLayout = new QVBoxLayout(calendarPage);
     auto *navigationLayout = new QHBoxLayout;
     auto *calendarTitle = new QLabel("Calendar View", this);
-    calendarTitle->setStyleSheet("font-size:20px;font-weight:bold;");
+    calendarTitle->setObjectName("PageTitle");
 
     auto *previousMonthButton = new QPushButton("Previous", this);
     auto *nextMonthButton = new QPushButton("Next", this);
     calendarMonthLabel = new QLabel(this);
-    calendarMonthLabel->setStyleSheet("font-size:18px;font-weight:bold;");
+    calendarMonthLabel->setObjectName("PageTitle");
     calendarYearCombo = new QComboBox(this);
     for (int year = 2010; year <= 2035; ++year) {
         calendarYearCombo->addItem(QString::number(year), year);
@@ -220,18 +255,13 @@ void MainWindow::setupCalendarView()
     calendarTable->setShowGrid(false);
     calendarTable->setWordWrap(true);
     calendarTable->setAlternatingRowColors(false);
-    calendarTable->setStyleSheet(
-        "QTableWidget { background: white; border: none; }"
-        "QHeaderView::section { border: none; padding: 8px 0; font-weight: 600; }"
-        "QTableWidget::item { margin: 4px; padding: 10px; border: 1px solid #ffffff; }"
-        "QTableWidget::item:selected { border: 2px solid #111827; }"
-    );
 
     for (int row = 0; row < calendarTable->rowCount(); ++row) {
         calendarTable->setRowHeight(row, 110);
     }
 
     calendarSummaryLabel = new QLabel(this);
+    calendarSummaryLabel->setObjectName("StatsCard");
     calendarSummaryLabel->setWordWrap(true);
     calendarSummaryLabel->setMinimumHeight(72);
 
@@ -306,20 +336,98 @@ void MainWindow::setupTradeTable()
     });
 }
 
-void MainWindow::loadStats() {
-    QString text = QString(
-        "Total Trades: %1\n"
-        "Wins: %2\n"
-        "Losses: %3\n"
-        "Win Rate: %4\n"
-        "Total R: %5"
-    ).arg(Stats::totalTrades())
-     .arg(Stats::wins())
-     .arg(Stats::losses())
-     .arg(Stats::winRate() * 100.0, 0, 'f', 1)
-     .arg(Stats::totalR());
+void MainWindow::setupAccountsView()
+{
+    auto *accountsPage = new QWidget(this);
+    auto *accountsLayout = new QVBoxLayout(accountsPage);
+    auto *selectorLayout = new QHBoxLayout;
+    auto *accountsTitle = new QLabel("Accounts Overview", this);
+    accountsTitle->setObjectName("PageTitle");
 
-    statsLabel->setText(text + "%");
+    accountSelectorCombo = new QComboBox(this);
+    accountSelectorCombo->addItems(Domain::accountOptions());
+
+    accountStatsLabel = new QLabel(this);
+    accountStatsLabel->setObjectName("StatsCard");
+    accountStatsLabel->setWordWrap(true);
+    accountStatsLabel->setMinimumHeight(110);
+
+    accountTradesTable = new QTableWidget(this);
+    accountTradesTable->setColumnCount(8);
+    accountTradesTable->setHorizontalHeaderLabels(
+        {"Date", "Pair", "Direction", "Setup", "Result", "Result (R)", "Result ($)", "Accounts"}
+    );
+    accountTradesTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    accountTradesTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    accountTradesTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    accountTradesTable->setAlternatingRowColors(true);
+    accountTradesTable->setWordWrap(false);
+    accountTradesTable->setTextElideMode(Qt::ElideRight);
+    accountTradesTable->verticalHeader()->setVisible(false);
+    accountTradesTable->horizontalHeader()->setStretchLastSection(true);
+
+    selectorLayout->addWidget(new QLabel("Account", this));
+    selectorLayout->addWidget(accountSelectorCombo);
+    selectorLayout->addStretch();
+
+    accountsLayout->addWidget(accountsTitle);
+    accountsLayout->addLayout(selectorLayout);
+    accountsLayout->addWidget(accountStatsLabel);
+    accountsLayout->addWidget(accountTradesTable);
+
+    viewTabs->addTab(accountsPage, "Accounts");
+
+    connect(accountSelectorCombo, &QComboBox::currentTextChanged, this, [this]() {
+        refreshAccountsView();
+    });
+}
+
+void MainWindow::loadStats() {
+    if (!tradeModel || !tradeProxyModel) {
+        return;
+    }
+
+    int totalTrades = 0;
+    int wins = 0;
+    int losses = 0;
+    double totalR = 0.0;
+
+    const int winLossColumn = tradeModel->fieldIndex("win_loss");
+    const int resultRColumn = tradeModel->fieldIndex("result_r");
+
+    for (int row = 0; row < tradeProxyModel->rowCount(); ++row) {
+        ++totalTrades;
+        const QModelIndex winLossIndex = tradeProxyModel->index(row, winLossColumn);
+        const QString result = tradeProxyModel->data(winLossIndex).toString().trimmed().toLower();
+        if (result == "w" || result == "win") {
+            ++wins;
+        } else if (result == "l" || result == "loss") {
+            ++losses;
+        }
+
+        const QModelIndex resultRIndex = tradeProxyModel->index(row, resultRColumn);
+        totalR += tradeProxyModel->data(resultRIndex).toDouble();
+    }
+
+    const double winRate = totalTrades == 0 ? 0.0 : (static_cast<double>(wins) / static_cast<double>(totalTrades)) * 100.0;
+    const QString setupContext = setupFilterCombo && setupFilterCombo->currentText() != "All"
+        ? QString(" (%1)").arg(setupFilterCombo->currentText())
+        : QString();
+
+    QString text = QString(
+        "Total Trades%1: %2\n"
+        "Wins: %3\n"
+        "Losses: %4\n"
+        "Win Rate: %5%\n"
+        "Total R: %6"
+    ).arg(setupContext)
+     .arg(totalTrades)
+     .arg(wins)
+     .arg(losses)
+     .arg(winRate, 0, 'f', 1)
+     .arg(totalR, 0, 'f', 2);
+
+    statsLabel->setText(text);
 }
 
 void MainWindow::refreshTrades()
@@ -332,7 +440,97 @@ void MainWindow::refreshTrades()
     applyFilters();
     tradeTable->resizeColumnsToContents();
     refreshCalendarView();
+    refreshAccountsView();
     updateActionState();
+}
+
+void MainWindow::refreshAccountsView()
+{
+    if (!accountSelectorCombo || !accountStatsLabel || !accountTradesTable) {
+        return;
+    }
+
+    const QString selectedAccount = Domain::normalizeAccountName(accountSelectorCombo->currentText());
+    const double initialBalance = Domain::startingBalanceForAccount(selectedAccount);
+
+    int totalTrades = 0;
+    int wins = 0;
+    int losses = 0;
+    double totalR = 0.0;
+    double totalUsd = 0.0;
+
+    accountTradesTable->setRowCount(0);
+
+    QSqlQuery q(Database::instance().getDB());
+    q.prepare(
+        "SELECT date, pair, direction, setup, win_loss, result_r, result_usd, account "
+        "FROM trades ORDER BY date DESC, id DESC"
+    );
+
+    if (!q.exec()) {
+        accountStatsLabel->setText("Could not load account analytics.");
+        return;
+    }
+
+    while (q.next()) {
+        const QStringList accounts = Domain::parseAccounts(q.value(7).toString());
+        if (!accounts.contains(selectedAccount)) {
+            continue;
+        }
+
+        ++totalTrades;
+        const QString result = q.value(4).toString().trimmed().toLower();
+        if (result == "w" || result == "win") {
+            ++wins;
+        } else if (result == "l" || result == "loss") {
+            ++losses;
+        }
+
+        const double resultR = q.value(5).toDouble();
+        const double resultUsd = q.value(6).toDouble();
+        totalR += resultR;
+        totalUsd += resultUsd;
+
+        const int row = accountTradesTable->rowCount();
+        accountTradesTable->insertRow(row);
+        accountTradesTable->setItem(row, 0, new QTableWidgetItem(q.value(0).toString()));
+        accountTradesTable->setItem(row, 1, new QTableWidgetItem(q.value(1).toString()));
+        accountTradesTable->setItem(row, 2, new QTableWidgetItem(q.value(2).toString()));
+        accountTradesTable->setItem(row, 3, new QTableWidgetItem(q.value(3).toString()));
+        accountTradesTable->setItem(row, 4, new QTableWidgetItem(q.value(4).toString()));
+        accountTradesTable->setItem(row, 5, new QTableWidgetItem(QString::number(resultR, 'f', 2)));
+        accountTradesTable->setItem(row, 6, new QTableWidgetItem(QString::number(resultUsd, 'f', 2)));
+        accountTradesTable->setItem(row, 7, new QTableWidgetItem(q.value(7).toString()));
+    }
+
+    accountTradesTable->resizeColumnsToContents();
+
+    const double currentBalance = initialBalance + totalUsd;
+    const double winRate = totalTrades == 0 ? 0.0 : (static_cast<double>(wins) / static_cast<double>(totalTrades)) * 100.0;
+    const QString pnlPrefix = totalUsd >= 0.0 ? "+$" : "-$";
+    const QString balancePrefix = currentBalance >= 0.0 ? "$" : "-$";
+
+    const QString analyticsText = QString(
+        "%1\n"
+        "Starting Balance: $%2\n"
+        "Current Balance: %3%4\n"
+        "P/L: %5%6\n"
+        "Trades: %7 | Wins: %8 | Losses: %9 | Win Rate: %10%\n"
+        "Total R: %11"
+    )
+        .arg(selectedAccount)
+        .arg(QString::number(initialBalance, 'f', 2))
+        .arg(balancePrefix)
+        .arg(QString::number(std::abs(currentBalance), 'f', 2))
+        .arg(pnlPrefix)
+        .arg(QString::number(std::abs(totalUsd), 'f', 2))
+        .arg(totalTrades)
+        .arg(wins)
+        .arg(losses)
+        .arg(QString::number(winRate, 'f', 1))
+        .arg(QString::number(totalR, 'f', 2));
+
+    accountStatsLabel->setText(analyticsText);
 }
 
 void MainWindow::refreshCalendarView()
@@ -567,8 +765,10 @@ void MainWindow::applyFilters()
 
     filterModel->setSearchText(searchEdit->text());
     filterModel->setSessionFilter(sessionFilterCombo->currentText());
+    filterModel->setSetupFilter(setupFilterCombo->currentText());
     filterModel->setResultFilter(resultFilterCombo->currentText());
     tradeTable->resizeColumnsToContents();
+    loadStats();
 }
 
 void MainWindow::addTrade()
@@ -717,4 +917,111 @@ DailyTradeSummary MainWindow::dailySummaryForDate(const QDate &date) const
     summary.totalR = q.value(1).toDouble();
     summary.totalUsd = q.value(2).toDouble();
     return summary;
+}
+
+void MainWindow::setupSettingsView()
+{
+    auto *settingsPage = new QWidget(this);
+    auto *outerLayout = new QVBoxLayout(settingsPage);
+    outerLayout->setContentsMargins(32, 24, 32, 24);
+    outerLayout->setSpacing(20);
+
+    auto *settingsTitle = new QLabel("Settings", this);
+    settingsTitle->setObjectName("PageTitle");
+
+    auto *themeGroupLabel = new QLabel("Theme", this);
+    themeGroupLabel->setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;");
+
+    themeButtonGroup = new QButtonGroup(this);
+
+    const struct {
+        Theme::ThemeId id;
+        QString icon;
+    } themes[] = {
+        { Theme::Bloomberg,     "■" },
+        { Theme::Glassmorphism, "◈" },
+        { Theme::HighContrast,  "◉" },
+    };
+
+    auto *cardsLayout = new QHBoxLayout;
+    cardsLayout->setSpacing(16);
+
+    for (const auto &t : themes) {
+        auto *card = new QWidget(settingsPage);
+        card->setObjectName("ThemeCard");
+        card->setFixedWidth(280);
+
+        auto *cardLayout = new QVBoxLayout(card);
+        cardLayout->setContentsMargins(16, 14, 16, 14);
+        cardLayout->setSpacing(6);
+
+        auto *radioRow = new QHBoxLayout;
+        auto *radio = new QRadioButton(t.icon + "  " + Theme::themeName(t.id), card);
+        radio->setObjectName("ThemeRadio");
+        radio->setChecked(t.id == currentThemeId);
+
+        radioRow->addWidget(radio);
+        radioRow->addStretch();
+
+        auto *descLabel = new QLabel(Theme::themeDescription(t.id), card);
+        descLabel->setObjectName("ThemeDesc");
+        descLabel->setWordWrap(true);
+
+        cardLayout->addLayout(radioRow);
+        cardLayout->addWidget(descLabel);
+
+        themeButtonGroup->addButton(radio, static_cast<int>(t.id));
+        cardsLayout->addWidget(card);
+    }
+    cardsLayout->addStretch();
+
+    // ── Updates section ──────────────────────────────────────────────────────
+    auto *updateGroupLabel = new QLabel("Updates", this);
+    updateGroupLabel->setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;");
+
+    auto *updateRow    = new QHBoxLayout;
+    auto *versionLabel = new QLabel(
+        QString("Current version: <b>v%1</b>").arg(APP_VERSION), this);
+    auto *updateBtn    = new QPushButton("Check for Updates", this);
+    updateBtn->setObjectName("PrimaryButton");
+    updateBtn->setFixedWidth(180);
+
+    updateRow->addWidget(versionLabel);
+    updateRow->addStretch();
+    updateRow->addWidget(updateBtn);
+
+    connect(updateBtn, &QPushButton::clicked, this, [this]() {
+        m_updater.checkForUpdates(this);
+    });
+
+    outerLayout->addWidget(settingsTitle);
+    outerLayout->addWidget(themeGroupLabel);
+    outerLayout->addLayout(cardsLayout);
+    outerLayout->addSpacing(8);
+    outerLayout->addWidget(updateGroupLabel);
+    outerLayout->addLayout(updateRow);
+    outerLayout->addStretch();
+
+    viewTabs->addTab(settingsPage, "Settings");
+
+    connect(themeButtonGroup, &QButtonGroup::idClicked, this, [this](int id) {
+        applyTheme(static_cast<Theme::ThemeId>(id));
+    });
+}
+
+void MainWindow::applyTheme(Theme::ThemeId id)
+{
+    currentThemeId = id;
+    qApp->setStyleSheet(Theme::stylesheetForTheme(id));
+
+    QSettings settings("Ledger", "Ledger");
+    settings.setValue("theme", static_cast<int>(id));
+
+    // Sync radio buttons if Settings tab already exists
+    if (themeButtonGroup) {
+        QAbstractButton *btn = themeButtonGroup->button(static_cast<int>(id));
+        if (btn) {
+            btn->setChecked(true);
+        }
+    }
 }

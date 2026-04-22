@@ -1,10 +1,12 @@
 #include "addtradedialog.h"
 #include "database.h"
+#include "constants.h"
 
 #include <QDate>
 #include <QDateEdit>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
+#include <QCheckBox>
 #include <QFileDialog>
 #include <QFormLayout>
 #include <QHBoxLayout>
@@ -57,17 +59,35 @@ QComboBox *createEditableComboBox(QWidget *parent, const QStringList &items)
     return comboBox;
 }
 
+QStringList selectedAccounts(const QCheckBox *funded1Check, const QCheckBox *funded2Check, const QCheckBox *liveCheck)
+{
+    QStringList accounts;
+    if (funded1Check->isChecked()) {
+        accounts << "Funded 1";
+    }
+    if (funded2Check->isChecked()) {
+        accounts << "Funded 2";
+    }
+    if (liveCheck->isChecked()) {
+        accounts << "Live";
+    }
+    return accounts;
+}
+
 }
 
 AddTradeDialog::AddTradeDialog(int tradeId, QWidget *parent)
     : QDialog(parent)
     , tradeId(tradeId)
 {
+    setObjectName("AddTradeDialog");
     setWindowTitle(tradeId >= 0 ? "Edit Trade" : "Add Trade");
     resize(520, 640);
 
     auto *layout = new QFormLayout(this);
     layout->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+    layout->setSpacing(10);
+    layout->setContentsMargins(18, 16, 18, 16);
 
     dateEdit = new QDateEdit(QDate::currentDate(), this);
     dateEdit->setCalendarPopup(true);
@@ -76,7 +96,8 @@ AddTradeDialog::AddTradeDialog(int tradeId, QWidget *parent)
     sessionCombo = createEditableComboBox(this, {"London", "New York", "Asia"});
     pairCombo = createEditableComboBox(this, instrumentList());
     directionCombo = createEditableComboBox(this, {"BUY", "SELL"});
-    setupCombo = createEditableComboBox(this, {"Breakout", "Pullback", "Liquidity Sweep"});
+    setupCombo = new QComboBox(this);
+    setupCombo->addItems(Domain::setupOptions());
 
     entrySpin = createPriceSpinBox(this);
     slSpin = createPriceSpinBox(this);
@@ -97,7 +118,16 @@ AddTradeDialog::AddTradeDialog(int tradeId, QWidget *parent)
     winLossCombo = new QComboBox(this);
     winLossCombo->addItems({"Win", "Loss", "Breakeven"});
 
-    accountEdit = new QLineEdit(this);
+    funded1Check = new QCheckBox("Funded 1", this);
+    funded2Check = new QCheckBox("Funded 2", this);
+    liveCheck = new QCheckBox("Live", this);
+    auto *accountLayout = new QHBoxLayout;
+    accountLayout->setContentsMargins(0, 0, 0, 0);
+    accountLayout->addWidget(funded1Check);
+    accountLayout->addWidget(funded2Check);
+    accountLayout->addWidget(liveCheck);
+    accountLayout->addStretch();
+
     screenshotEdit = new QLineEdit(this);
     notesEdit = new QTextEdit(this);
     notesEdit->setMinimumHeight(120);
@@ -124,10 +154,15 @@ AddTradeDialog::AddTradeDialog(int tradeId, QWidget *parent)
     layout->addRow("Result (R)", resultRSpin);
     layout->addRow("Result ($)", resultUsdSpin);
     layout->addRow("Win/Loss", winLossCombo);
-    layout->addRow("Account", accountEdit);
+    layout->addRow("Accounts", accountLayout);
     layout->addRow("Screenshot", screenshotLayout);
     layout->addRow("Notes", notesEdit);
     layout->addWidget(buttonBox);
+
+    // Mark save button as primary so the active app theme styles it
+    if (QPushButton *saveButton = buttonBox->button(QDialogButtonBox::Save)) {
+        saveButton->setObjectName("PrimaryButton");
+    }
 
     connect(browseButton, &QPushButton::clicked, this, &AddTradeDialog::browseScreenshot);
     connect(buttonBox, &QDialogButtonBox::accepted, this, &AddTradeDialog::saveTrade);
@@ -187,7 +222,16 @@ void AddTradeDialog::loadTrade()
     resultRSpin->setValue(q.value(11).toDouble());
     resultUsdSpin->setValue(q.value(12).toDouble());
     winLossCombo->setCurrentText(q.value(13).toString());
-    accountEdit->setText(q.value(14).toString());
+    const QStringList accounts = Domain::parseAccounts(q.value(14).toString());
+    for (const QString &account : accounts) {
+        if (account == "Funded 1") {
+            funded1Check->setChecked(true);
+        } else if (account == "Funded 2") {
+            funded2Check->setChecked(true);
+        } else if (account == "Live") {
+            liveCheck->setChecked(true);
+        }
+    }
     screenshotEdit->setText(q.value(15).toString());
     notesEdit->setPlainText(q.value(16).toString());
 }
@@ -197,6 +241,12 @@ void AddTradeDialog::saveTrade()
     QSqlQuery q(Database::instance().getDB());
     if (pairCombo->currentText().trimmed().isEmpty()) {
         QMessageBox::warning(this, "Missing Pair", "Please enter a trading instrument.");
+        return;
+    }
+
+    const QStringList accounts = selectedAccounts(funded1Check, funded2Check, liveCheck);
+    if (accounts.isEmpty()) {
+        QMessageBox::warning(this, "Missing Account", "Please select at least one account.");
         return;
     }
 
@@ -232,7 +282,7 @@ void AddTradeDialog::saveTrade()
     q.addBindValue(resultRSpin->value());
     q.addBindValue(resultUsdSpin->value());
     q.addBindValue(winLossCombo->currentText());
-    q.addBindValue(accountEdit->text().trimmed());
+    q.addBindValue(Domain::joinAccounts(accounts));
     q.addBindValue(screenshotEdit->text().trimmed());
     q.addBindValue(notesEdit->toPlainText().trimmed());
 

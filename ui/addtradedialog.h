@@ -4,6 +4,7 @@
 class QComboBox;
 class QDateEdit;
 class QDoubleSpinBox;
+class QCheckBox;
 class QLineEdit;
 class QTextEdit;
 
@@ -32,7 +33,9 @@ private:
     QDoubleSpinBox *resultRSpin = nullptr;
     QDoubleSpinBox *resultUsdSpin = nullptr;
     QComboBox *winLossCombo = nullptr;
-    QLineEdit *accountEdit = nullptr;
+    QCheckBox *funded1Check = nullptr;
+    QCheckBox *funded2Check = nullptr;
+    QCheckBox *liveCheck = nullptr;
     QLineEdit *screenshotEdit = nullptr;
     QTextEdit *notesEdit = nullptr;
     int tradeId = -1;
