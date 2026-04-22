@@ -1,0 +1,61 @@
+name: Build & Release (Windows)
+
+# Trigger: push a version tag, e.g. git tag v1.0.1 && git push --tags
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Install Qt6 with MSVC on Windows
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.6.3'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+          cache: true
+
+      # Set up MSVC compiler environment
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      # Configure — pass the git tag as APP_VERSION (e.g. "v1.0.1")
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DAPP_VERSION="${{ github.ref_name }}"
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      # Bundle all required Qt DLLs and plugins next to the .exe
+      - name: Deploy Qt dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path deploy
+          Copy-Item build\Release\Ledger.exe deploy\
+          windeployqt --release --no-translations --no-system-d3d-compiler `
+            --no-opengl-sw deploy\Ledger.exe
+
+      # Zip the deploy folder — named after the tag for easy identification
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path deploy\* `
+            -DestinationPath "Ledger-${{ github.ref_name }}.zip"
+
+      # Create a GitHub Release and attach the zip
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Ledger-${{ github.ref_name }}.zip
+          generate_release_notes: true
