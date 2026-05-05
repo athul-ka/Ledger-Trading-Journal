@@ -1,0 +1,168 @@
+//@version=5
+indicator("Position Fetcher", overlay=true, max_lines_count=6, max_labels_count=6)
+
+// ── Mode controls (Fetch / Remove) ───────────────────────────────────────
+modeGroup = "Mode"
+fetchBtn  = input.bool(true,  "Fetch",  inline="actions", group=modeGroup)
+removeBtn = input.bool(false, "Remove", inline="actions", group=modeGroup)
+sendBtn   = input.bool(false, "Send →", inline="actions", group=modeGroup,
+                       tooltip="Toggle ON to push the copy string to a TradingView alert notification. Copy it from there.")
+mode = removeBtn ? "Remove" : "Fetch"
+
+// ── Pair and position values ──────────────────────────────────────────────
+pair = syminfo.ticker
+
+priceDecimalsForSymbol(symbol) =>
+    symbolUpper = str.upper(symbol)
+    symbolUpper == "BTCUSD" or symbolUpper == "ETHUSD" ? 1 :
+     symbolUpper == "XAUUSD" ? 2 :
+     symbolUpper == "XAGUSD" ? 3 :
+     symbolUpper == "US30" or symbolUpper == "DJ30" or symbolUpper == "DJIA" ? 2 :
+     symbolUpper == "NAS100" or symbolUpper == "US100" or symbolUpper == "NASDAQ100" ? 1 :
+     symbolUpper == "SP500" or symbolUpper == "US500" ? 1 :
+     str.endswith(symbolUpper, "JPY") ? 3 : 5
+
+priceMaskForDecimals(decimals) =>
+    switch decimals
+        1 => "#.0"
+        2 => "#.00"
+        3 => "#.000"
+        4 => "#.0000"
+        => "#.#####"
+
+positionGroup = "Position"
+entryPrice = input.price(0.0, "Entry Price", confirm=true, group=positionGroup)
+slPrice    = input.price(0.0, "Stop Loss",   confirm=true, group=positionGroup)
+tpPrice    = input.price(0.0, "Take Profit", confirm=true, group=positionGroup)
+
+// ── Style controls ────────────────────────────────────────────────────────
+lineGroup = "Line Style"
+lineLength = input.int(50, "Line Length (bars)", minval=5, maxval=500, group=lineGroup)
+lineWidth  = input.int(2, "Line Width", minval=1, maxval=5, group=lineGroup)
+entryColor = input.color(color.blue,  "Entry Color", group=lineGroup)
+slColor    = input.color(color.red,   "SL Color",    group=lineGroup)
+tpColor    = input.color(color.green, "TP Color",    group=lineGroup)
+
+uiGroup = "UI Colors"
+uiTableBg      = input.color(color.new(color.black, 55), "Table Background", group=uiGroup)
+uiTableBorder  = input.color(color.new(color.gray, 60),  "Table Border",     group=uiGroup)
+uiTableFrame   = input.color(color.new(color.gray, 40),  "Table Frame",      group=uiGroup)
+uiTitleColor   = input.color(color.gray,                  "Title Text",       group=uiGroup)
+uiValueColor   = input.color(color.white,                 "Value Text",       group=uiGroup)
+uiCopyText     = input.color(color.new(color.white, 20),  "Copy Text",        group=uiGroup)
+uiLabelBg      = input.color(color.new(color.gray, 70),   "Label Background", group=uiGroup)
+
+// ── Calculations ──────────────────────────────────────────────────────────
+direction = tpPrice > entryPrice ? "BUY" : "SELL"
+risk      = math.abs(entryPrice - slPrice)
+reward    = math.abs(tpPrice - entryPrice)
+rr        = risk > 0 ? reward / risk : 0.0
+slPct     = entryPrice > 0 ? risk / entryPrice * 100 : 0.0
+tpPct     = entryPrice > 0 ? reward / entryPrice * 100 : 0.0
+priceMask = priceMaskForDecimals(priceDecimalsForSymbol(pair))
+
+copyStr = pair + " " + direction +
+          " E:"  + str.tostring(entryPrice, priceMask) +
+          " SL:" + str.tostring(slPrice, priceMask) +
+          " TP:" + str.tostring(tpPrice, priceMask)
+
+// ── Drawing objects (no red/green boxes) ─────────────────────────────────
+var line entryLine = na
+var line slLine    = na
+var line tpLine    = na
+var label entryLbl = na
+var label slLbl    = na
+var label tpLbl    = na
+
+clearDrawings() =>
+    line.delete(entryLine)
+    line.delete(slLine)
+    line.delete(tpLine)
+    label.delete(entryLbl)
+    label.delete(slLbl)
+    label.delete(tpLbl)
+
+if barstate.islast
+    clearDrawings()
+
+hasValues = entryPrice > 0 and slPrice > 0 and tpPrice > 0
+isRemoveMode = mode == "Remove"
+
+if barstate.islast and hasValues and not isRemoveMode
+    leftX  = bar_index - lineLength
+    rightX = bar_index
+
+    entryLine := line.new(leftX, entryPrice, rightX, entryPrice,
+                          extend=extend.right, color=entryColor,
+                          width=lineWidth, style=line.style_solid)
+    slLine    := line.new(leftX, slPrice, rightX, slPrice,
+                          extend=extend.right, color=slColor,
+                          width=lineWidth, style=line.style_solid)
+    tpLine    := line.new(leftX, tpPrice, rightX, tpPrice,
+                          extend=extend.right, color=tpColor,
+                          width=lineWidth, style=line.style_solid)
+
+    entryLbl := label.new(rightX, entryPrice,
+                          " Entry " + str.tostring(entryPrice, priceMask) + " " + direction,
+                          xloc=xloc.bar_index, yloc=yloc.price,
+                          style=label.style_label_right,
+                          color=uiLabelBg, textcolor=uiValueColor, size=size.small)
+    slLbl    := label.new(rightX, slPrice,
+                          " SL " + str.tostring(slPrice, priceMask) +
+                          "  -" + str.tostring(slPct, "#.##") + "%",
+                          xloc=xloc.bar_index, yloc=yloc.price,
+                          style=label.style_label_right,
+                          color=color.new(slColor, 60), textcolor=uiValueColor, size=size.small)
+    tpLbl    := label.new(rightX, tpPrice,
+                          " TP " + str.tostring(tpPrice, priceMask) +
+                          "  +" + str.tostring(tpPct, "#.##") + "%  R:R " + str.tostring(rr, "#.##"),
+                          xloc=xloc.bar_index, yloc=yloc.price,
+                          style=label.style_label_right,
+                          color=color.new(tpColor, 60), textcolor=uiValueColor, size=size.small)
+
+// ── Table UI ──────────────────────────────────────────────────────────────
+var table tbl = table.new(position.top_right, 2, 8,
+                          bgcolor=uiTableBg,
+                          border_color=uiTableBorder,
+                          border_width=1,
+                          frame_color=uiTableFrame,
+                          frame_width=1)
+
+if barstate.islast
+    dirColor = direction == "BUY" ? tpColor : slColor
+    optionsRow = (fetchBtn ? "[Fetch]" : "Fetch") + "  " +
+                 (removeBtn ? "[Remove]" : "Remove") + "  " +
+                 (sendBtn ? "[Send →]" : "Send →")
+
+    table.cell(tbl, 0, 0, "Pair",      text_color=uiTitleColor, text_size=size.small)
+    table.cell(tbl, 1, 0, pair,          text_color=uiValueColor, text_size=size.small)
+    table.cell(tbl, 0, 1, "Direction", text_color=uiTitleColor, text_size=size.small)
+    table.cell(tbl, 1, 1, direction,     text_color=dirColor,     text_size=size.small)
+    table.cell(tbl, 0, 2, "Entry",     text_color=uiTitleColor, text_size=size.small)
+    table.cell(tbl, 1, 2, str.tostring(entryPrice, priceMask), text_color=entryColor, text_size=size.small)
+    table.cell(tbl, 0, 3, "SL",        text_color=uiTitleColor, text_size=size.small)
+    table.cell(tbl, 1, 3, str.tostring(slPrice, priceMask), text_color=slColor, text_size=size.small)
+    table.cell(tbl, 0, 4, "TP",        text_color=uiTitleColor, text_size=size.small)
+    table.cell(tbl, 1, 4, str.tostring(tpPrice, priceMask), text_color=tpColor, text_size=size.small)
+    table.cell(tbl, 0, 5, "RR",        text_color=uiTitleColor, text_size=size.small)
+    table.cell(tbl, 1, 5, str.tostring(rr, "#.##") + " : 1", text_color=uiValueColor, text_size=size.small)
+    table.cell(tbl, 0, 6, "Options",   text_color=uiTitleColor, text_size=size.small)
+    table.cell(tbl, 1, 6, optionsRow,   text_color=uiCopyText,   text_size=size.small)
+
+    // Make copy row visually prominent for faster manual copy.
+    copyBg = color.new(color.navy, 35)
+    table.cell(tbl, 0, 7, "COPY",      text_color=color.yellow, text_size=size.normal, bgcolor=copyBg)
+    table.cell(tbl, 1, 7, copyStr,      text_color=color.white,  text_size=size.normal, bgcolor=copyBg)
+
+// ── Send: fires alert notification when Send toggle is turned ON ──────────
+// One-time setup: In TradingView top bar → Alerts (bell icon) → Create Alert →
+// Condition: "Position Fetcher" / "send_signal" — message is auto-filled.
+// After setup, every time you toggle Send ON, a notification fires with the
+// full Ledger string. Click the notification to copy from it.
+alertcondition(sendBtn, title="Position Fetcher Signal",
+               message="Ledger Signal: copy the string from the alert log.")
+var bool prevSend = false
+if barstate.islast and sendBtn and not prevSend and hasValues
+    alert(copyStr, alert.freq_once_per_bar)
+if barstate.islast
+    prevSend := sendBtn

@@ -1,6 +1,7 @@
 #include "addtradedialog.h"
 #include "database.h"
 #include "constants.h"
+#include "instrumentformat.h"
 
 #include <QDate>
 #include <QDateEdit>
@@ -9,11 +10,15 @@
 #include <QCheckBox>
 #include <QFileDialog>
 #include <QFormLayout>
+#include <QGuiApplication>
+#include <QClipboard>
 #include <QHBoxLayout>
 #include <QLineEdit>
+#include <QLocale>
 #include <QMessageBox>
 #include <QComboBox>
 #include <QPushButton>
+#include <QRegularExpression>
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QTextEdit>
@@ -39,7 +44,27 @@ QDoubleSpinBox *createPriceSpinBox(QWidget *parent)
     spinBox->setDecimals(5);
     spinBox->setRange(0.0, 1000000000.0);
     spinBox->setSingleStep(0.0001);
+    spinBox->setLocale(QLocale::c());
+    spinBox->setGroupSeparatorShown(false);
     return spinBox;
+}
+
+void applyInstrumentPriceFormat(QDoubleSpinBox *spinBox, const QString &instrument)
+{
+    const double value = spinBox->value();
+    spinBox->setDecimals(InstrumentFormat::priceDecimals(instrument));
+    spinBox->setSingleStep(InstrumentFormat::priceStep(instrument));
+    spinBox->setValue(value);
+}
+
+void applyInstrumentPriceFormat(const QString &instrument,
+                                QDoubleSpinBox *entrySpin,
+                                QDoubleSpinBox *slSpin,
+                                QDoubleSpinBox *tpSpin)
+{
+    applyInstrumentPriceFormat(entrySpin, instrument);
+    applyInstrumentPriceFormat(slSpin, instrument);
+    applyInstrumentPriceFormat(tpSpin, instrument);
 }
 
 QDoubleSpinBox *createMetricSpinBox(QWidget *parent)
@@ -102,6 +127,7 @@ AddTradeDialog::AddTradeDialog(int tradeId, QWidget *parent)
     entrySpin = createPriceSpinBox(this);
     slSpin = createPriceSpinBox(this);
     tpSpin = createPriceSpinBox(this);
+    applyInstrumentPriceFormat(pairCombo->currentText(), entrySpin, slSpin, tpSpin);
     rrSpin = createMetricSpinBox(this);
     rrSpin->setRange(-1000.0, 1000.0);
     riskPercentSpin = createMetricSpinBox(this);
@@ -145,6 +171,12 @@ AddTradeDialog::AddTradeDialog(int tradeId, QWidget *parent)
     layout->addRow("Pair", pairCombo);
     layout->addRow("Direction", directionCombo);
     layout->addRow("Setup", setupCombo);
+
+    auto *pasteTvButton = new QPushButton("⬇  Paste from TradingView", this);
+    pasteTvButton->setToolTip("Paste clipboard text copied from the TradingView indicator.\n"
+                              "Expected format:  EURUSD BUY E:1.2345 SL:1.2300 TP:1.2400");
+    layout->addRow(pasteTvButton);
+
     layout->addRow("Entry", entrySpin);
     layout->addRow("SL", slSpin);
     layout->addRow("TP", tpSpin);
@@ -157,6 +189,7 @@ AddTradeDialog::AddTradeDialog(int tradeId, QWidget *parent)
     layout->addRow("Accounts", accountLayout);
     layout->addRow("Screenshot", screenshotLayout);
     layout->addRow("Notes", notesEdit);
+
     layout->addWidget(buttonBox);
 
     // Mark save button as primary so the active app theme styles it
@@ -167,6 +200,10 @@ AddTradeDialog::AddTradeDialog(int tradeId, QWidget *parent)
     connect(browseButton, &QPushButton::clicked, this, &AddTradeDialog::browseScreenshot);
     connect(buttonBox, &QDialogButtonBox::accepted, this, &AddTradeDialog::saveTrade);
     connect(buttonBox, &QDialogButtonBox::rejected, this, &AddTradeDialog::reject);
+    connect(pasteTvButton, &QPushButton::clicked, this, &AddTradeDialog::pasteFromTradingView);
+    connect(pairCombo, &QComboBox::currentTextChanged, this, [this](const QString &pair) {
+        applyInstrumentPriceFormat(pair, entrySpin, slSpin, tpSpin);
+    });
 
     if (tradeId >= 0) {
         buttonBox->button(QDialogButtonBox::Save)->setText("Update");
@@ -296,4 +333,67 @@ void AddTradeDialog::saveTrade()
     }
 
     accept();
+}
+
+// ---------------------------------------------------------------------------
+// TradingView clipboard import
+// ---------------------------------------------------------------------------
+void AddTradeDialog::pasteFromTradingView()
+{
+    const QString text = QGuiApplication::clipboard()->text().trimmed();
+    if (text.isEmpty()) {
+        QMessageBox::information(this, "Paste from TradingView",
+            "Clipboard is empty.\n\n"
+            "Copy the formatted text from the TradingView indicator first.\n\n"
+            "Expected format:\n"
+            "  EURUSD BUY E:1.2345 SL:1.2300 TP:1.2400");
+        return;
+    }
+
+    // Match:  PAIR  BUY|SELL  E(NTRY)?:value  S(L)?:value  T(P)?:value
+    static const QRegularExpression pairDirRe(
+        R"(^([A-Z0-9]+)\s+(BUY|SELL)\b)", QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression entryRe(
+        R"(\b(?:ENTRY|E):([\d.]+))", QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression slRe(
+        R"(\bSL?:([\d.]+))", QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression tpRe(
+        R"(\bTP?:([\d.]+))", QRegularExpression::CaseInsensitiveOption);
+
+    bool allFound = true;
+
+    const auto pairDirMatch = pairDirRe.match(text);
+    if (pairDirMatch.hasMatch()) {
+        pairCombo->setCurrentText(pairDirMatch.captured(1).toUpper());
+        directionCombo->setCurrentText(pairDirMatch.captured(2).toUpper());
+    }
+
+    const auto entryMatch = entryRe.match(text);
+    if (entryMatch.hasMatch()) {
+        entrySpin->setValue(entryMatch.captured(1).toDouble());
+    } else {
+        allFound = false;
+    }
+
+    const auto slMatch = slRe.match(text);
+    if (slMatch.hasMatch()) {
+        slSpin->setValue(slMatch.captured(1).toDouble());
+    } else {
+        allFound = false;
+    }
+
+    const auto tpMatch = tpRe.match(text);
+    if (tpMatch.hasMatch()) {
+        tpSpin->setValue(tpMatch.captured(1).toDouble());
+    } else {
+        allFound = false;
+    }
+
+    if (!allFound) {
+        QMessageBox::warning(this, "Paste from TradingView",
+            "Could not fully parse the clipboard text.\n\n"
+            "Expected format:\n"
+            "  EURUSD BUY E:1.2345 SL:1.2300 TP:1.2400\n\n"
+            "Clipboard contained:\n" + text.left(120));
+    }
 }

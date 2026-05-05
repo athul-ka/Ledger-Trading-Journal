@@ -2,6 +2,9 @@
 #include "database.h"
 #include "addtradedialog.h"
 #include "constants.h"
+#include "instrumentformat.h"
+#include "lotcalculator.h"
+#include "signalwriter.h"
 #include "theme.h"
 
 #include <QAbstractItemView>
@@ -14,13 +17,20 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFont>
+#include <QFormLayout>
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
 #include <QLineEdit>
+#include <QLocale>
 #include <QPushButton>
 #include <QMessageBox>
 #include <QComboBox>
+#include <QCheckBox>
+#include <QClipboard>
+#include <QDateTime>
+#include <QDoubleSpinBox>
+#include <QGuiApplication>
 #include <QRegularExpression>
 #include <QSortFilterProxyModel>
 #include <QSqlQuery>
@@ -127,6 +137,116 @@ QString csvEscape(const QString &value)
     return QString("\"%1\"").arg(escaped);
 }
 
+QStringList instrumentList()
+{
+    return {
+        "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
+        "EURGBP", "EURJPY", "EURCHF", "EURCAD", "EURAUD", "EURNZD",
+        "GBPJPY", "GBPCHF", "GBPCAD", "GBPAUD", "GBPNZD",
+        "AUDJPY", "AUDCHF", "AUDCAD", "AUDNZD",
+        "NZDJPY", "NZDCHF", "NZDCAD",
+        "CADJPY", "CADCHF", "CHFJPY",
+        "NAS100", "US30", "XAUUSD", "XAGUSD", "BTCUSD", "ETHUSD"
+    };
+}
+
+QDoubleSpinBox *createPriceSpinBox(QWidget *parent)
+{
+    auto *spinBox = new QDoubleSpinBox(parent);
+    spinBox->setDecimals(5);
+    spinBox->setRange(0.0, 1000000000.0);
+    spinBox->setSingleStep(0.0001);
+    spinBox->setLocale(QLocale::c());
+    spinBox->setGroupSeparatorShown(false);
+    return spinBox;
+}
+
+void applyInstrumentPriceFormat(QDoubleSpinBox *spinBox, const QString &instrument)
+{
+    const QSignalBlocker blocker(spinBox);
+    const double value = spinBox->value();
+    spinBox->setDecimals(InstrumentFormat::priceDecimals(instrument));
+    spinBox->setSingleStep(InstrumentFormat::priceStep(instrument));
+    spinBox->setValue(value);
+}
+
+void applyInstrumentPriceFormat(const QString &instrument,
+                                QDoubleSpinBox *entrySpin,
+                                QDoubleSpinBox *slSpin,
+                                QDoubleSpinBox *tpSpin)
+{
+    applyInstrumentPriceFormat(entrySpin, instrument);
+    applyInstrumentPriceFormat(slSpin, instrument);
+    applyInstrumentPriceFormat(tpSpin, instrument);
+}
+
+QDoubleSpinBox *createMoneySpinBox(QWidget *parent)
+{
+    auto *spinBox = new QDoubleSpinBox(parent);
+    spinBox->setDecimals(2);
+    spinBox->setRange(0.0, 1000000000.0);
+    spinBox->setSingleStep(1.0);
+    spinBox->setPrefix("$");
+    return spinBox;
+}
+
+bool parseTradingViewText(const QString &text,
+                          QString &pair,
+                          QString &direction,
+                          double &entry,
+                          double &sl,
+                          double &tp)
+{
+    static const QRegularExpression pairDirRe(
+        R"(^([A-Z0-9]+)\s+(BUY|SELL)\b)", QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression entryRe(
+        R"(\b(?:ENTRY|E):([\d.]+))", QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression slRe(
+        R"(\bSL?:([\d.]+))", QRegularExpression::CaseInsensitiveOption);
+    static const QRegularExpression tpRe(
+        R"(\bTP?:([\d.]+))", QRegularExpression::CaseInsensitiveOption);
+
+    const auto pairDirMatch = pairDirRe.match(text.trimmed());
+    if (!pairDirMatch.hasMatch()) {
+        return false;
+    }
+
+    const auto entryMatch = entryRe.match(text);
+    const auto slMatch = slRe.match(text);
+    const auto tpMatch = tpRe.match(text);
+    if (!entryMatch.hasMatch() || !slMatch.hasMatch() || !tpMatch.hasMatch()) {
+        return false;
+    }
+
+    pair = pairDirMatch.captured(1).toUpper();
+    direction = pairDirMatch.captured(2).toUpper();
+    entry = entryMatch.captured(1).toDouble();
+    sl = slMatch.captured(1).toDouble();
+    tp = tpMatch.captured(1).toDouble();
+    return true;
+}
+
+double currentBalanceForAccount(const QString &account)
+{
+    const QString normalized = Domain::normalizeAccountName(account);
+    double totalUsd = 0.0;
+
+    QSqlQuery q(Database::instance().getDB());
+    q.prepare("SELECT account, result_usd FROM trades");
+    if (!q.exec()) {
+        return Domain::startingBalanceForAccount(normalized);
+    }
+
+    while (q.next()) {
+        const QStringList accounts = Domain::parseAccounts(q.value(0).toString());
+        if (accounts.contains(normalized)) {
+            totalUsd += q.value(1).toDouble();
+        }
+    }
+
+    return Domain::startingBalanceForAccount(normalized) + totalUsd;
+}
+
 }
 
 MainWindow::MainWindow(QWidget *parent)
@@ -200,6 +320,7 @@ void MainWindow::setupUI() {
     viewTabs->addTab(tradesPage, "Trades");
     setupCalendarView();
     setupAccountsView();
+    setupExecuteView();
     setupSettingsView();
 
     layout->addWidget(viewTabs);
@@ -380,6 +501,127 @@ void MainWindow::setupAccountsView()
     connect(accountSelectorCombo, &QComboBox::currentTextChanged, this, [this]() {
         refreshAccountsView();
     });
+}
+
+void MainWindow::setupExecuteView()
+{
+    auto *executePage = new QWidget(this);
+    auto *outer = new QVBoxLayout(executePage);
+    outer->setContentsMargins(24, 18, 24, 18);
+    outer->setSpacing(12);
+
+    auto *title = new QLabel("Execute", this);
+    title->setObjectName("PageTitle");
+
+    auto *form = new QFormLayout;
+    form->setFieldGrowthPolicy(QFormLayout::ExpandingFieldsGrow);
+
+    executePairCombo = new QComboBox(this);
+    executePairCombo->setEditable(true);
+    executePairCombo->addItems(instrumentList());
+
+    executeDirectionCombo = new QComboBox(this);
+    executeDirectionCombo->setEditable(false);
+    executeDirectionCombo->addItems({"BUY", "SELL"});
+
+    executeEntrySpin = createPriceSpinBox(this);
+    executeSlSpin = createPriceSpinBox(this);
+    executeTpSpin = createPriceSpinBox(this);
+
+    auto *pasteButton = new QPushButton("Paste from TradingView", this);
+    pasteButton->setObjectName("PrimaryButton");
+
+    form->addRow("Pair", executePairCombo);
+    form->addRow("Direction", executeDirectionCombo);
+    form->addRow("Entry", executeEntrySpin);
+    form->addRow("SL", executeSlSpin);
+    form->addRow("TP", executeTpSpin);
+    form->addRow("TradingView", pasteButton);
+
+    auto *accountsLabel = new QLabel("Accounts", this);
+    accountsLabel->setStyleSheet("font-size: 15px; font-weight: 700;");
+
+    executeFunded1Check = new QCheckBox("Funded 1", this);
+    executeFunded2Check = new QCheckBox("Funded 2", this);
+    executeLiveCheck = new QCheckBox("Live", this);
+
+    executeFunded1RiskSpin = createMoneySpinBox(this);
+    executeFunded2RiskSpin = createMoneySpinBox(this);
+    executeLiveRiskSpin = createMoneySpinBox(this);
+    executeFunded1RiskSpin->setValue(50.0);
+    executeFunded2RiskSpin->setValue(50.0);
+    executeLiveRiskSpin->setValue(10.0);
+
+    executeFunded1LotLabel = new QLabel("Lot: -", this);
+    executeFunded2LotLabel = new QLabel("Lot: -", this);
+    executeLiveLotLabel = new QLabel("Lot: -", this);
+
+    auto *funded1Box = new QVBoxLayout;
+    funded1Box->addWidget(executeFunded1Check);
+    funded1Box->addWidget(new QLabel("Risk Dollar", this));
+    funded1Box->addWidget(executeFunded1RiskSpin);
+    funded1Box->addWidget(executeFunded1LotLabel);
+
+    auto *funded2Box = new QVBoxLayout;
+    funded2Box->addWidget(executeFunded2Check);
+    funded2Box->addWidget(new QLabel("Risk Dollar", this));
+    funded2Box->addWidget(executeFunded2RiskSpin);
+    funded2Box->addWidget(executeFunded2LotLabel);
+
+    auto *liveBox = new QVBoxLayout;
+    liveBox->addWidget(executeLiveCheck);
+    liveBox->addWidget(new QLabel("Risk Dollar", this));
+    liveBox->addWidget(executeLiveRiskSpin);
+    liveBox->addWidget(executeLiveLotLabel);
+
+    auto *riskRow = new QHBoxLayout;
+    riskRow->addLayout(funded1Box, 1);
+    riskRow->addLayout(funded2Box, 1);
+    riskRow->addLayout(liveBox, 1);
+
+    executeLotsSummaryLabel = new QLabel("Lot sizes will appear here after calculation.", this);
+    executeLotsSummaryLabel->setWordWrap(true);
+    executeLotsSummaryLabel->setObjectName("StatsCard");
+
+    auto *calculateBtn = new QPushButton("Calculate Lot Sizes", this);
+    calculateBtn->setObjectName("PrimaryButton");
+    auto *executeBtn = new QPushButton("Execute", this);
+    executeBtn->setObjectName("PrimaryButton");
+
+    auto *buttonRow = new QHBoxLayout;
+    buttonRow->addWidget(calculateBtn);
+    buttonRow->addWidget(executeBtn);
+    buttonRow->addStretch();
+
+    outer->addWidget(title);
+    outer->addLayout(form);
+    outer->addWidget(accountsLabel);
+    outer->addLayout(riskRow);
+    outer->addWidget(executeLotsSummaryLabel);
+    outer->addLayout(buttonRow);
+    outer->addStretch();
+
+    viewTabs->addTab(executePage, "Execute");
+
+    connect(pasteButton, &QPushButton::clicked, this, &MainWindow::pasteExecuteFromTradingView);
+    connect(executeFunded1Check, &QCheckBox::toggled, this, &MainWindow::updateExecuteAccountInputs);
+    connect(executeFunded2Check, &QCheckBox::toggled, this, &MainWindow::updateExecuteAccountInputs);
+    connect(executeLiveCheck, &QCheckBox::toggled, this, &MainWindow::updateExecuteAccountInputs);
+    connect(calculateBtn, &QPushButton::clicked, this, &MainWindow::calculateExecuteLotSizes);
+    connect(executeBtn, &QPushButton::clicked, this, &MainWindow::executeTradesToMt5);
+    connect(executeEntrySpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::calculateExecuteLotSizes);
+    connect(executeSlSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::calculateExecuteLotSizes);
+    connect(executeTpSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::calculateExecuteLotSizes);
+    connect(executeFunded1RiskSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::calculateExecuteLotSizes);
+    connect(executeFunded2RiskSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::calculateExecuteLotSizes);
+    connect(executeLiveRiskSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &MainWindow::calculateExecuteLotSizes);
+    connect(executePairCombo, &QComboBox::currentTextChanged, this, [this](const QString &pair) {
+        applyInstrumentPriceFormat(pair, executeEntrySpin, executeSlSpin, executeTpSpin);
+        calculateExecuteLotSizes();
+    });
+
+    applyInstrumentPriceFormat(executePairCombo->currentText(), executeEntrySpin, executeSlSpin, executeTpSpin);
+    updateExecuteAccountInputs();
 }
 
 void MainWindow::loadStats() {
@@ -894,6 +1136,231 @@ void MainWindow::handleTableActivated()
     editSelectedTrade();
 }
 
+void MainWindow::pasteExecuteFromTradingView()
+{
+    const QString text = QGuiApplication::clipboard()->text().trimmed();
+    if (text.isEmpty()) {
+        QMessageBox::information(this, "Paste from TradingView",
+                                 "Clipboard is empty.");
+        return;
+    }
+
+    QString pair;
+    QString direction;
+    double entry = 0.0;
+    double sl = 0.0;
+    double tp = 0.0;
+    if (!parseTradingViewText(text, pair, direction, entry, sl, tp)) {
+        QMessageBox::warning(this,
+                             "Paste from TradingView",
+                             "Could not parse text. Expected format: EURUSD BUY E:1.2345 SL:1.2300 TP:1.2400");
+        return;
+    }
+
+    executePairCombo->setCurrentText(pair);
+    executeDirectionCombo->setCurrentText(direction);
+    executeEntrySpin->setValue(entry);
+    executeSlSpin->setValue(sl);
+    executeTpSpin->setValue(tp);
+    calculateExecuteLotSizes();
+}
+
+void MainWindow::updateExecuteAccountInputs()
+{
+    const bool funded1 = executeFunded1Check->isChecked();
+    const bool funded2 = executeFunded2Check->isChecked();
+    const bool live = executeLiveCheck->isChecked();
+
+    executeFunded1RiskSpin->setEnabled(funded1);
+    executeFunded2RiskSpin->setEnabled(funded2);
+    executeLiveRiskSpin->setEnabled(live);
+    calculateExecuteLotSizes();
+}
+
+void MainWindow::calculateExecuteLotSizes()
+{
+    const double entry = executeEntrySpin->value();
+    const double sl = executeSlSpin->value();
+    const double tp = executeTpSpin->value();
+    const QString pair = executePairCombo->currentText().trimmed();
+
+    if (entry <= 0.0 || sl <= 0.0 || tp <= 0.0 || pair.isEmpty()) {
+        executeFunded1LotLabel->setText("Lot: -");
+        executeFunded2LotLabel->setText("Lot: -");
+        executeLiveLotLabel->setText("Lot: -");
+        executeLotsSummaryLabel->setText("Enter Pair, Entry, SL and TP.");
+        return;
+    }
+
+    QStringList lines;
+    if (executeFunded1Check->isChecked()) {
+        const double lot = LotCalculator::calculateLotSizeFromRiskAmount(
+            pair, entry, sl, executeFunded1RiskSpin->value());
+        executeFunded1LotLabel->setText(QString("Lot: %1").arg(QString::number(lot, 'f', 2)));
+        lines << QString("Funded 1  | Risk: $%1 | Lot: %2")
+                 .arg(QString::number(executeFunded1RiskSpin->value(), 'f', 2))
+                 .arg(QString::number(lot, 'f', 2));
+    } else {
+        executeFunded1LotLabel->setText("Lot: -");
+    }
+    if (executeFunded2Check->isChecked()) {
+        const double lot = LotCalculator::calculateLotSizeFromRiskAmount(
+            pair, entry, sl, executeFunded2RiskSpin->value());
+        executeFunded2LotLabel->setText(QString("Lot: %1").arg(QString::number(lot, 'f', 2)));
+        lines << QString("Funded 2  | Risk: $%1 | Lot: %2")
+                 .arg(QString::number(executeFunded2RiskSpin->value(), 'f', 2))
+                 .arg(QString::number(lot, 'f', 2));
+    } else {
+        executeFunded2LotLabel->setText("Lot: -");
+    }
+    if (executeLiveCheck->isChecked()) {
+        const double lot = LotCalculator::calculateLotSizeFromRiskAmount(
+            pair, entry, sl, executeLiveRiskSpin->value());
+        executeLiveLotLabel->setText(QString("Lot: %1").arg(QString::number(lot, 'f', 2)));
+        lines << QString("Live      | Risk: $%1 | Lot: %2")
+                 .arg(QString::number(executeLiveRiskSpin->value(), 'f', 2))
+                 .arg(QString::number(lot, 'f', 2));
+    } else {
+        executeLiveLotLabel->setText("Lot: -");
+    }
+
+    if (lines.isEmpty()) {
+        executeLotsSummaryLabel->setText("Select at least one account to calculate lot size.");
+        return;
+    }
+
+    executeLotsSummaryLabel->setText(lines.join("\n"));
+}
+
+void MainWindow::executeTradesToMt5()
+{
+    const QString pair = executePairCombo->currentText().trimmed().toUpper();
+    const QString direction = executeDirectionCombo->currentText().trimmed().toUpper();
+    const double entry = executeEntrySpin->value();
+    const double sl = executeSlSpin->value();
+    const double tp = executeTpSpin->value();
+
+    if (pair.isEmpty() || (direction != "BUY" && direction != "SELL") ||
+        entry <= 0.0 || sl <= 0.0 || tp <= 0.0)
+    {
+        QMessageBox::warning(this,
+                             "Execute",
+                             "Please provide valid pair, direction, entry, SL and TP.");
+        return;
+    }
+
+    QVector<SignalWriter::SignalItem> items;
+    struct AccountPlan { QString name; double risk; double lot; };
+    QVector<AccountPlan> plans;
+
+    const auto addPlan = [&](bool enabled, const QString &name, double risk) {
+        if (!enabled) return;
+        const double lot = LotCalculator::calculateLotSizeFromRiskAmount(pair, entry, sl, risk);
+        if (risk <= 0.0 || lot <= 0.0) return;
+        SignalWriter::SignalItem item;
+        item.pair = pair;
+        item.direction = direction;
+        item.entry = entry;
+        item.sl = sl;
+        item.tp = tp;
+        item.lotSize = lot;
+        item.account = name;
+        items.push_back(item);
+        plans.push_back({name, risk, lot});
+    };
+
+    addPlan(executeFunded1Check->isChecked(), "Funded 1", executeFunded1RiskSpin->value());
+    addPlan(executeFunded2Check->isChecked(), "Funded 2", executeFunded2RiskSpin->value());
+    addPlan(executeLiveCheck->isChecked(), "Live", executeLiveRiskSpin->value());
+
+    if (items.isEmpty()) {
+        QMessageBox::warning(this,
+                             "Execute",
+                             "Select at least one account and set a valid risk amount.");
+        return;
+    }
+
+    QSettings settings("Ledger", "Ledger");
+    const QString signalPath = settings.value("mt5SignalPath", "ledger_signal.json").toString();
+
+    QString errorMsg;
+    if (!SignalWriter::writeSignalQueue(items, signalPath, errorMsg)) {
+        QMessageBox::critical(this,
+                              "Execute Failed",
+                              QString("Could not write signal queue to:\n%1\n\nError: %2")
+                                  .arg(signalPath, errorMsg));
+        return;
+    }
+
+    const double rr = LotCalculator::calculateRR(entry, sl, tp);
+    int journaled = 0;
+    for (const AccountPlan &plan : plans) {
+        if (insertJournalEntryForExecution(plan.name, pair, direction, entry, sl, tp, rr, plan.lot, plan.risk)) {
+            ++journaled;
+        }
+    }
+
+    refreshTrades();
+    loadStats();
+
+    QMessageBox::information(
+        this,
+        "Executed",
+        QString("Signals queued for MT5: %1\nJournal entries added: %2\n\nSignal file:\n%3")
+            .arg(items.size())
+            .arg(journaled)
+            .arg(signalPath));
+}
+
+bool MainWindow::insertJournalEntryForExecution(const QString &account,
+                                                const QString &pair,
+                                                const QString &direction,
+                                                double entry,
+                                                double sl,
+                                                double tp,
+                                                double rr,
+                                                double lotSize,
+                                                double riskAmount)
+{
+    QSqlQuery q(Database::instance().getDB());
+    q.prepare(
+        "INSERT INTO trades ("
+        "date, session, pair, direction, setup, entry, sl, tp, rr, risk_percent, lot_size, "
+        "result_r, result_usd, win_loss, account, screenshot, notes"
+        ") VALUES ("
+        "?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?"
+        ")"
+    );
+
+    const double accountSize = currentBalanceForAccount(account);
+    const double riskPercent = accountSize > 0.0 ? (riskAmount / accountSize) * 100.0 : 0.0;
+    const QString note = QString("Auto-added from Execute. Risk $%1")
+                            .arg(QString::number(riskAmount, 'f', 2));
+
+    q.addBindValue(QDate::currentDate().toString("yyyy-MM-dd"));
+    q.addBindValue("-");
+    q.addBindValue(pair);
+    q.addBindValue(direction);
+    q.addBindValue("Simple");
+    q.addBindValue(entry);
+    q.addBindValue(sl);
+    q.addBindValue(tp);
+    q.addBindValue(rr);
+    q.addBindValue(riskPercent);
+    q.addBindValue(lotSize);
+    q.addBindValue(0.0);
+    q.addBindValue(0.0);
+    q.addBindValue("Breakeven");
+    q.addBindValue(account);
+    q.addBindValue("");
+    q.addBindValue(note);
+
+    if (!q.exec()) {
+        return false;
+    }
+    return true;
+}
+
 DailyTradeSummary MainWindow::dailySummaryForDate(const QDate &date) const
 {
     DailyTradeSummary summary;
@@ -953,7 +1420,7 @@ void MainWindow::setupSettingsView()
 
         auto *cardLayout = new QVBoxLayout(card);
         cardLayout->setContentsMargins(16, 14, 16, 14);
-        cardLayout->setSpacing(6);
+        cardLayout->setSpacing(2);
 
         auto *radioRow = new QHBoxLayout;
         auto *radio = new QRadioButton(t.icon + "  " + Theme::themeName(t.id), card);
@@ -963,43 +1430,81 @@ void MainWindow::setupSettingsView()
         radioRow->addWidget(radio);
         radioRow->addStretch();
 
-        auto *descLabel = new QLabel(Theme::themeDescription(t.id), card);
-        descLabel->setObjectName("ThemeDesc");
-        descLabel->setWordWrap(true);
-
         cardLayout->addLayout(radioRow);
-        cardLayout->addWidget(descLabel);
 
         themeButtonGroup->addButton(radio, static_cast<int>(t.id));
         cardsLayout->addWidget(card);
     }
     cardsLayout->addStretch();
 
+    outerLayout->addWidget(settingsTitle);
+    outerLayout->addWidget(themeGroupLabel);
+    outerLayout->addLayout(cardsLayout);
+    outerLayout->addSpacing(8);
+
+    // ── MT5 Integration ──────────────────────────────────────────────────────
+    auto *mt5GroupLabel = new QLabel("MT5 Integration", this);
+    mt5GroupLabel->setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;");
+
+    auto *mt5HintLabel = new QLabel(
+        "Path where the LedgerBridge.mq5 EA reads the signal file. "
+        "Point this to your MT5 terminal's MQL5\\Files\\ folder.", this);
+    mt5HintLabel->setWordWrap(true);
+    mt5HintLabel->setStyleSheet("color: gray; font-size: 11px;");
+
+    auto *mt5PathEdit  = new QLineEdit(this);
+    mt5PathEdit->setPlaceholderText("e.g. C:\\Users\\You\\AppData\\Roaming\\MetaQuotes\\Terminal\\...\\MQL5\\Files\\ledger_signal.json");
+    {
+        QSettings s("Ledger", "Ledger");
+        mt5PathEdit->setText(s.value("mt5SignalPath", "ledger_signal.json").toString());
+    }
+
+    auto *mt5BrowseBtn = new QPushButton("Browse", this);
+    mt5BrowseBtn->setFixedWidth(80);
+
+    auto *mt5Row = new QHBoxLayout;
+    mt5Row->addWidget(mt5PathEdit);
+    mt5Row->addWidget(mt5BrowseBtn);
+
+    outerLayout->addWidget(mt5GroupLabel);
+    outerLayout->addWidget(mt5HintLabel);
+    outerLayout->addLayout(mt5Row);
+
     // ── Updates section ──────────────────────────────────────────────────────
     auto *updateGroupLabel = new QLabel("Updates", this);
     updateGroupLabel->setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;");
 
-    auto *updateRow    = new QHBoxLayout;
-    auto *versionLabel = new QLabel(
-        QString("Current version: <b>v%1</b>").arg(APP_VERSION), this);
-    auto *updateBtn    = new QPushButton("Check for Updates", this);
+    auto *updateRow = new QHBoxLayout;
+    auto *versionLabel = new QLabel(QString("Current version: <b>v%1</b>").arg(APP_VERSION), this);
+    auto *updateBtn = new QPushButton("Check for Updates", this);
     updateBtn->setObjectName("PrimaryButton");
     updateBtn->setFixedWidth(180);
-
     updateRow->addWidget(versionLabel);
     updateRow->addStretch();
     updateRow->addWidget(updateBtn);
+
+    outerLayout->addWidget(updateGroupLabel);
+    outerLayout->addLayout(updateRow);
+
+    connect(mt5PathEdit, &QLineEdit::textChanged, this, [](const QString &text) {
+        QSettings s("Ledger", "Ledger");
+        s.setValue("mt5SignalPath", text);
+    });
+
+    connect(mt5BrowseBtn, &QPushButton::clicked, this, [mt5PathEdit]() {
+        const QString path = QFileDialog::getSaveFileName(
+            nullptr,
+            "Select Signal File Location",
+            mt5PathEdit->text(),
+            "JSON Files (*.json);;All Files (*)");
+        if (!path.isEmpty())
+            mt5PathEdit->setText(path);
+    });
 
     connect(updateBtn, &QPushButton::clicked, this, [this]() {
         m_updater.checkForUpdates(this);
     });
 
-    outerLayout->addWidget(settingsTitle);
-    outerLayout->addWidget(themeGroupLabel);
-    outerLayout->addLayout(cardsLayout);
-    outerLayout->addSpacing(8);
-    outerLayout->addWidget(updateGroupLabel);
-    outerLayout->addLayout(updateRow);
     outerLayout->addStretch();
 
     viewTabs->addTab(settingsPage, "Settings");

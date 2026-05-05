@@ -18,6 +18,7 @@ private:
     void browseScreenshot();
     void loadTrade();
     void saveTrade();
+    void pasteFromTradingView();
 
     QDateEdit *dateEdit = nullptr;
     QComboBox *sessionCombo = nullptr;

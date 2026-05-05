@@ -6,6 +6,8 @@
 
 class QButtonGroup;
 class QComboBox;
+class QCheckBox;
+class QDoubleSpinBox;
 class QLabel;
 class QLineEdit;
 class QPushButton;
@@ -32,6 +34,7 @@ private:
     void setupTradeTable();
     void setupCalendarView();
     void setupAccountsView();
+    void setupExecuteView();
     void setupSettingsView();
     void applyTheme(Theme::ThemeId id);
     void loadStats();
@@ -50,6 +53,19 @@ private:
     void deleteSelectedTrade();
     void exportTradesToCsv();
     void handleTableActivated();
+    void pasteExecuteFromTradingView();
+    void updateExecuteAccountInputs();
+    void calculateExecuteLotSizes();
+    void executeTradesToMt5();
+    bool insertJournalEntryForExecution(const QString &account,
+                                        const QString &pair,
+                                        const QString &direction,
+                                        double entry,
+                                        double sl,
+                                        double tp,
+                                        double rr,
+                                        double lotSize,
+                                        double riskAmount);
     DailyTradeSummary dailySummaryForDate(const QDate &date) const;
 
     QLabel *statsLabel = nullptr;
@@ -71,7 +87,27 @@ private:
     QPushButton *editButton = nullptr;
     QPushButton *deleteButton = nullptr;
     QPushButton *exportButton = nullptr;
+
+    // Execute tab widgets
+    QComboBox *executePairCombo = nullptr;
+    QComboBox *executeDirectionCombo = nullptr;
+    QDoubleSpinBox *executeEntrySpin = nullptr;
+    QDoubleSpinBox *executeSlSpin = nullptr;
+    QDoubleSpinBox *executeTpSpin = nullptr;
+    QCheckBox *executeFunded1Check = nullptr;
+    QCheckBox *executeFunded2Check = nullptr;
+    QCheckBox *executeLiveCheck = nullptr;
+    QDoubleSpinBox *executeFunded1RiskSpin = nullptr;
+    QDoubleSpinBox *executeFunded2RiskSpin = nullptr;
+    QDoubleSpinBox *executeLiveRiskSpin = nullptr;
+    QLabel *executeFunded1LotLabel = nullptr;
+    QLabel *executeFunded2LotLabel = nullptr;
+    QLabel *executeLiveLotLabel = nullptr;
+    QLabel *executeLotsSummaryLabel = nullptr;
+
     QButtonGroup *themeButtonGroup = nullptr;
-    Theme::ThemeId currentThemeId = Theme::Bloomberg;    Updater        m_updater;    QDate currentCalendarMonth;
+    Theme::ThemeId currentThemeId = Theme::Bloomberg;
+    Updater m_updater;
+    QDate currentCalendarMonth;
     QDate selectedCalendarDate;
 };
