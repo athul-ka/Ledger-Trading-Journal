@@ -6,6 +6,9 @@
 #include "lotcalculator.h"
 #include "signalwriter.h"
 #include "theme.h"
+#include "alertswidget.h"
+#include "alertsync.h"
+#include "pricefetcher.h"
 
 #include <QAbstractItemView>
 #include <QApplication>
@@ -322,6 +325,7 @@ void MainWindow::setupUI() {
     setupAccountsView();
     setupExecuteView();
     setupSettingsView();
+    setupAlertsView();
 
     layout->addWidget(viewTabs);
 
@@ -1386,6 +1390,56 @@ DailyTradeSummary MainWindow::dailySummaryForDate(const QDate &date) const
     return summary;
 }
 
+void MainWindow::setupAlertsView()
+{
+    m_alertsWidget = new AlertsWidget(this);
+    viewTabs->addTab(m_alertsWidget, "Alerts");
+
+    // ── System tray icon for desktop notifications ─────────────────────────
+    if (QSystemTrayIcon::isSystemTrayAvailable()) {
+        m_trayIcon = new QSystemTrayIcon(this);
+        m_trayIcon->setIcon(QApplication::windowIcon().isNull()
+                                ? QIcon::fromTheme("dialog-information")
+                                : QApplication::windowIcon());
+        m_trayIcon->show();
+    }
+
+    // ── PriceFetcher (local 60-second polling for desktop notifications) ───
+    m_priceFetcher = new PriceFetcher(this);
+
+    connect(m_alertsWidget, &AlertsWidget::alertsChanged, this, [this]() {
+        m_priceFetcher->setAlerts(m_alertsWidget->alerts());
+        AlertSync::syncAll(m_alertSyncNam, m_alertsWidget->alerts());
+    });
+
+    connect(m_priceFetcher, &PriceFetcher::priceUpdated,
+            m_alertsWidget, &AlertsWidget::onPriceUpdated);
+
+    connect(m_priceFetcher, &PriceFetcher::alertTriggered,
+            this, [this](const PriceAlert &alert, double price, bool isTouch) {
+        m_alertsWidget->onAlertTriggered(alert, price, isTouch);
+
+        const QString title = isTouch
+            ? QString("TOUCH — %1").arg(alert.pair)
+            : QString("NEAR  — %1").arg(alert.pair);
+        const QString body = QString("Level %1  |  Current %2  |  %3")
+            .arg(alert.targetPrice, 0, 'f', InstrumentFormat::priceDecimals(alert.pair))
+            .arg(price,             0, 'f', InstrumentFormat::priceDecimals(alert.pair))
+            .arg(alert.notes.isEmpty() ? "" : "| " + alert.notes);
+
+        if (m_trayIcon)
+            m_trayIcon->showMessage(title, body, QSystemTrayIcon::Information, 8000);
+    });
+
+    {
+        QSettings s("Ledger", "Ledger");
+        if (!s.value("twelveDataKey").toString().isEmpty()) {
+            m_priceFetcher->setAlerts(m_alertsWidget->alerts());
+            m_priceFetcher->start();
+        }
+    }
+}
+
 void MainWindow::setupSettingsView()
 {
     auto *settingsPage = new QWidget(this);
@@ -1508,6 +1562,54 @@ void MainWindow::setupSettingsView()
     outerLayout->addStretch();
 
     viewTabs->addTab(settingsPage, "Settings");
+    // ── Price Alerts & Notifications ─────────────────────────────────────────
+    auto *alertsGroupLabel = new QLabel("Price Alerts &amp; Notifications", this);
+    alertsGroupLabel->setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;");
+
+    auto *alertsHint = new QLabel(
+        "Enter your Raspberry Pi server address and API keys to receive "
+        "Telegram alerts even when this app is closed.", this);
+    alertsHint->setWordWrap(true);
+    alertsHint->setStyleSheet("color: gray; font-size: 11px;");
+
+    auto *piUrlEdit       = new QLineEdit(this);
+    auto *tdKeyEdit       = new QLineEdit(this);
+    auto *tgTokenEdit     = new QLineEdit(this);
+    auto *tgChatIdEdit    = new QLineEdit(this);
+
+    piUrlEdit->setPlaceholderText("http://192.168.x.x:8000");
+    tdKeyEdit->setPlaceholderText("Twelve Data API key (free at twelvedata.com)");
+    tgTokenEdit->setPlaceholderText("Telegram Bot token from @BotFather");
+    tgChatIdEdit->setPlaceholderText("Telegram Chat ID from @userinfobot");
+    tgTokenEdit->setEchoMode(QLineEdit::Password);
+
+    {
+        QSettings s("Ledger", "Ledger");
+        piUrlEdit->setText(s.value("piServerUrl").toString());
+        tdKeyEdit->setText(s.value("twelveDataKey").toString());
+        tgTokenEdit->setText(s.value("telegramToken").toString());
+        tgChatIdEdit->setText(s.value("telegramChatId").toString());
+    }
+
+    auto *alertsForm = new QFormLayout;
+    alertsForm->setSpacing(8);
+    alertsForm->addRow("Pi Server URL",       piUrlEdit);
+    alertsForm->addRow("Twelve Data Key",     tdKeyEdit);
+    alertsForm->addRow("Telegram Bot Token",  tgTokenEdit);
+    alertsForm->addRow("Telegram Chat ID",    tgChatIdEdit);
+
+    outerLayout->insertWidget(outerLayout->count() - 1, alertsGroupLabel);
+    outerLayout->insertWidget(outerLayout->count() - 1, alertsHint);
+    outerLayout->insertLayout(outerLayout->count() - 1, alertsForm);
+
+    auto saveSetting = [](const QString &key, const QString &value) {
+        QSettings s("Ledger", "Ledger");
+        s.setValue(key, value.trimmed());
+    };
+    connect(piUrlEdit,    &QLineEdit::textChanged, this, [saveSetting](const QString &v) { saveSetting("piServerUrl",    v); });
+    connect(tdKeyEdit,    &QLineEdit::textChanged, this, [saveSetting](const QString &v) { saveSetting("twelveDataKey",  v); });
+    connect(tgTokenEdit,  &QLineEdit::textChanged, this, [saveSetting](const QString &v) { saveSetting("telegramToken",  v); });
+    connect(tgChatIdEdit, &QLineEdit::textChanged, this, [saveSetting](const QString &v) { saveSetting("telegramChatId", v); });
 
     connect(themeButtonGroup, &QButtonGroup::idClicked, this, [this](int id) {
         applyTheme(static_cast<Theme::ThemeId>(id));

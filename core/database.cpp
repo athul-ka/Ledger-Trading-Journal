@@ -1,4 +1,5 @@
 #include "database.h"
+#include "pricealert.h"
 #include <QtSql/QSqlQuery>
 #include <QtSql/QSqlError>
 #include <QtSql/QSqlRecord>
@@ -76,7 +77,8 @@ bool Database::connect() {
     ensureColumnExists(db, "account", "TEXT");
     ensureColumnExists(db, "screenshot", "TEXT");
 
-    return true;
+        AlertDB::createTable(db);
+        return true;
 }
 
 QSqlDatabase& Database::getDB() {

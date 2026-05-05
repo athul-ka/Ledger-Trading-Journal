@@ -1,0 +1,18 @@
+[Unit]
+Description=Ledger Alert Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/ledger-alerts
+EnvironmentFile=/home/pi/ledger-alerts/.env
+ExecStart=/home/pi/ledger-alerts/venv/bin/uvicorn server:app --host 0.0.0.0 --port ${PORT:-8000}
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

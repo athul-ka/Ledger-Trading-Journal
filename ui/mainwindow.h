@@ -3,6 +3,10 @@
 #include <QDate>
 #include "theme.h"
 #include "updater.h"
+#include "pricefetcher.h"
+#include "alertswidget.h"
+#include <QSystemTrayIcon>
+#include <QNetworkAccessManager>
 
 class QButtonGroup;
 class QComboBox;
@@ -36,6 +40,7 @@ private:
     void setupAccountsView();
     void setupExecuteView();
     void setupSettingsView();
+        void setupAlertsView();
     void applyTheme(Theme::ThemeId id);
     void loadStats();
     void refreshTrades();
@@ -110,4 +115,10 @@ private:
     Updater m_updater;
     QDate currentCalendarMonth;
     QDate selectedCalendarDate;
+
+    // Price alerts
+    AlertsWidget         *m_alertsWidget   = nullptr;
+    PriceFetcher         *m_priceFetcher   = nullptr;
+    QSystemTrayIcon      *m_trayIcon       = nullptr;
+    QNetworkAccessManager m_alertSyncNam;
 };
