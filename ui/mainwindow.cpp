@@ -324,8 +324,8 @@ void MainWindow::setupUI() {
     setupCalendarView();
     setupAccountsView();
     setupExecuteView();
-    setupSettingsView();
     setupAlertsView();
+    setupSettingsView();
 
     layout->addWidget(viewTabs);
 

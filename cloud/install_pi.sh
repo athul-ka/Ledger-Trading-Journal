@@ -36,12 +36,27 @@ echo "  ✓ Dependencies installed"
 # ── 4. .env file (config) ─────────────────────────────────────────────────────
 if [ ! -f "$ENV_FILE" ]; then
     cat > "$ENV_FILE" << 'EOF'
-# Twelve Data free API key — https://twelvedata.com/register
-TWELVE_DATA_KEY=YOUR_KEY_HERE
-
 # Telegram Bot — get token from @BotFather, get chat id from @userinfobot
 TELEGRAM_TOKEN=YOUR_BOT_TOKEN_HERE
 TELEGRAM_CHAT_ID=YOUR_CHAT_ID_HERE
+
+# Twelve Data (optimized budget mode)
+TWELVE_DATA_KEY=YOUR_TWELVE_DATA_KEY_HERE
+ENABLE_TWELVE_DATA_POLL=1
+ALERT_TIMEZONE=Europe/Berlin
+POLL_START_HOUR=7
+POLL_END_HOUR=23
+POLL_INTERVAL_SECONDS=300
+MAX_DAILY_CREDITS=800
+# Keep as 1 unless your plan/account docs confirm different billing behavior.
+CREDITS_PER_SYMBOL_REQUEST=1
+
+# Optional shared key required on /ingest/* endpoints (recommended)
+INGEST_SHARED_KEY=CHANGE_ME_TO_A_LONG_RANDOM_SECRET
+
+# Source state thresholds
+HEARTBEAT_STALE_SECONDS=15
+HEARTBEAT_OFFLINE_SECONDS=45
 
 # Port the server listens on  (default 8000)
 PORT=8000
