@@ -25,6 +25,8 @@ add_executable(Ledger
     core/updater.cpp
     ui/mainwindow.cpp
     ui/addtradedialog.cpp
+    ui/alertswidget.cpp
+    core/pricefetcher.cpp
 )
 
 target_include_directories(Ledger PRIVATE
