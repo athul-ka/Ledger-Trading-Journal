@@ -1611,6 +1611,27 @@ void MainWindow::setupSettingsView()
     connect(tgTokenEdit,  &QLineEdit::textChanged, this, [saveSetting](const QString &v) { saveSetting("telegramToken",  v); });
     connect(tgChatIdEdit, &QLineEdit::textChanged, this, [saveSetting](const QString &v) { saveSetting("telegramChatId", v); });
 
+    const auto syncRemoteAlertSettings = [this]() {
+        AlertSync::syncSettings(m_alertSyncNam);
+
+        if (!m_priceFetcher || !m_alertsWidget) return;
+
+        QSettings s("Ledger", "Ledger");
+        m_priceFetcher->setAlerts(m_alertsWidget->alerts());
+        if (s.value("twelveDataKey").toString().trimmed().isEmpty()) {
+            m_priceFetcher->stop();
+            return;
+        }
+
+        m_priceFetcher->start();
+        m_priceFetcher->refresh();
+    };
+
+    connect(piUrlEdit, &QLineEdit::editingFinished, this, syncRemoteAlertSettings);
+    connect(tdKeyEdit, &QLineEdit::editingFinished, this, syncRemoteAlertSettings);
+    connect(tgTokenEdit, &QLineEdit::editingFinished, this, syncRemoteAlertSettings);
+    connect(tgChatIdEdit, &QLineEdit::editingFinished, this, syncRemoteAlertSettings);
+
     connect(themeButtonGroup, &QButtonGroup::idClicked, this, [this](int id) {
         applyTheme(static_cast<Theme::ThemeId>(id));
     });

@@ -19,6 +19,7 @@ import json
 import os
 import sqlite3
 from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 import websockets
@@ -31,6 +32,8 @@ TWELVE_DATA_KEY  = os.getenv("TWELVE_DATA_KEY",  "")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DB_PATH          = os.path.join(os.path.dirname(__file__), "alerts.db")
+CONFIG_PATH      = Path(os.path.dirname(__file__)) / "runtime_config.json"
+REST_FALLBACK_SECONDS = max(30, int(os.getenv("REST_FALLBACK_SECONDS", "120")))
 
 # Pairs that Twelve Data does NOT stream via WebSocket on the free plan.
 # These are polled via REST every 5 minutes instead.
@@ -64,6 +67,34 @@ def init_db():
             )
         """)
         conn.commit()
+
+
+def load_runtime_config():
+    global TWELVE_DATA_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+
+    if not CONFIG_PATH.exists():
+        return
+
+    try:
+        config = json.loads(CONFIG_PATH.read_text())
+    except Exception as exc:
+        print(f"[Config] Failed to read {CONFIG_PATH.name}: {exc}")
+        return
+
+    TWELVE_DATA_KEY = str(config.get("twelve_data_key", TWELVE_DATA_KEY)).strip()
+    TELEGRAM_TOKEN = str(config.get("telegram_token", TELEGRAM_TOKEN)).strip()
+    TELEGRAM_CHAT_ID = str(config.get("telegram_chat_id", TELEGRAM_CHAT_ID)).strip()
+    print("[Config] Loaded runtime settings")
+
+
+def save_runtime_config(twelve_data_key: str, telegram_token: str, telegram_chat_id: str):
+    config = {
+        "twelve_data_key": twelve_data_key.strip(),
+        "telegram_token": telegram_token.strip(),
+        "telegram_chat_id": telegram_chat_id.strip(),
+    }
+    CONFIG_PATH.write_text(json.dumps(config, indent=2))
+    print(f"[Config] Saved runtime settings to {CONFIG_PATH.name}")
 
 
 # ── Symbol helpers ────────────────────────────────────────────────────────────
@@ -121,15 +152,20 @@ def pip_size(pair: str) -> float:
 
 async def send_telegram(message: str):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        print("[Telegram] Skipped: TELEGRAM_TOKEN or TELEGRAM_CHAT_ID missing")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     async with httpx.AsyncClient(timeout=10) as client:
         try:
-            await client.post(url, json={
+            response = await client.post(url, json={
                 "chat_id":    TELEGRAM_CHAT_ID,
                 "text":       message,
                 "parse_mode": "HTML",
             })
+            if response.is_success:
+                print("[Telegram] Delivered")
+            else:
+                print(f"[Telegram] API error {response.status_code}: {response.text}")
         except Exception as exc:
             print(f"[Telegram] Error: {exc}")
 
@@ -157,12 +193,11 @@ async def evaluate_alerts(pair: str, price: float):
             if (dist_pips <= 1.0
                     and not row["touch_triggered"]
                     and atype in ("TOUCH", "BOTH")):
+                print(f"[Alert] TOUCH {pair} target={target} price={price} dist={dist_pips:.2f}p")
                 conn.execute(
                     "UPDATE alerts SET touch_triggered = 1 WHERE id = ?", (row["id"],)
                 )
                 conn.commit()
-                dec = max(1, round(-1 * (ps - 1)))  # rough decimal count
-                fmt = f"{{:.{len(str(target).rstrip('0').split('.')[-1])}f}}"
                 msg = (
                     f"🎯 <b>TOUCH ALERT — {pair}</b>\n"
                     f"Your level : <b>{target}</b>\n"
@@ -177,6 +212,7 @@ async def evaluate_alerts(pair: str, price: float):
                     and dist_pips > 1.0
                     and not row["near_triggered"]
                     and atype in ("NEAR", "BOTH")):
+                print(f"[Alert] NEAR {pair} target={target} price={price} dist={dist_pips:.2f}p")
                 conn.execute(
                     "UPDATE alerts SET near_triggered = 1 WHERE id = ?", (row["id"],)
                 )
@@ -217,6 +253,7 @@ async def ws_price_worker():
             asyncio.create_task(index_rest_poller(rest_pairs))
 
         if not ws_pairs:
+            print("[WS] No active streaming pairs yet; retrying in 30 s")
             await asyncio.sleep(30)
             continue
 
@@ -242,10 +279,55 @@ async def ws_price_worker():
                         price = float(data.get("price", 0))
                         if price > 0:
                             await evaluate_alerts(from_td(sym), price)
+                    elif data.get("event") not in (None, "heartbeat", "subscribe-status"):
+                        print(f"[WS] Ignored event: {data}")
 
         except Exception as exc:
             print(f"[WS] Disconnected: {exc}  — reconnecting in 15 s …")
             await asyncio.sleep(15)
+
+
+async def all_pairs_rest_fallback_worker():
+    """
+    Poll all active pairs at a low rate as a reliability fallback.
+    This keeps alerts working even if the websocket stream stalls.
+    """
+    if not TWELVE_DATA_KEY:
+        print("[REST-Fallback] Disabled: TWELVE_DATA_KEY missing")
+        return
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        while True:
+            try:
+                with db_conn() as conn:
+                    rows = conn.execute(
+                        "SELECT DISTINCT pair FROM alerts WHERE active = 1"
+                    ).fetchall()
+
+                pairs = [r["pair"] for r in rows]
+                if not pairs:
+                    await asyncio.sleep(REST_FALLBACK_SECONDS)
+                    continue
+
+                symbols = ",".join(to_td(p) for p in pairs)
+                resp = await client.get(
+                    f"https://api.twelvedata.com/price?symbol={symbols}&apikey={TWELVE_DATA_KEY}"
+                )
+                data = resp.json()
+
+                if isinstance(data, dict) and data.get("code"):
+                    print(f"[REST-Fallback] API error: {data}")
+                else:
+                    for pair in pairs:
+                        sym = to_td(pair)
+                        if sym in data and "price" in data[sym]:
+                            await evaluate_alerts(pair, float(data[sym]["price"]))
+                        elif len(pairs) == 1 and "price" in data:
+                            await evaluate_alerts(pair, float(data["price"]))
+            except Exception as exc:
+                print(f"[REST-Fallback] Error: {exc}")
+
+            await asyncio.sleep(REST_FALLBACK_SECONDS)
 
 
 # ── REST poller for indices (not available on free WS plan) ──────────────────
@@ -280,8 +362,10 @@ async def index_rest_poller(pairs: list[str]):
 @app.on_event("startup")
 async def on_startup():
     init_db()
+    load_runtime_config()
     asyncio.create_task(ws_price_worker())
-    print("[Server] Ledger Alert Server started")
+    asyncio.create_task(all_pairs_rest_fallback_worker())
+    print(f"[Server] Ledger Alert Server started (fallback poll: {REST_FALLBACK_SECONDS}s)")
 
 
 # ── REST endpoints ────────────────────────────────────────────────────────────
@@ -292,6 +376,12 @@ class AlertIn(BaseModel):
     near_pips:    float = 10.0
     alert_type:   str   = "BOTH"
     notes:        str   = ""
+
+
+class SettingsIn(BaseModel):
+    twelve_data_key: str = ""
+    telegram_token: str = ""
+    telegram_chat_id: str = ""
 
 
 @app.get("/health")
@@ -369,7 +459,25 @@ def sync_alerts(alerts: list[AlertIn]):
                 ),
             )
         conn.commit()
+    print(f"[Sync] Loaded {len(alerts)} alerts from app")
     return {"synced": len(alerts)}
+
+
+@app.post("/settings/sync")
+def sync_settings(settings: SettingsIn):
+    global TWELVE_DATA_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+
+    TWELVE_DATA_KEY = settings.twelve_data_key.strip()
+    TELEGRAM_TOKEN = settings.telegram_token.strip()
+    TELEGRAM_CHAT_ID = settings.telegram_chat_id.strip()
+    save_runtime_config(TWELVE_DATA_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+    print("[Sync] Applied remote settings from app")
+    return {
+        "synced": True,
+        "has_twelve_data_key": bool(TWELVE_DATA_KEY),
+        "has_telegram_token": bool(TELEGRAM_TOKEN),
+        "has_telegram_chat_id": bool(TELEGRAM_CHAT_ID),
+    }
 
 
 @app.get("/prices")

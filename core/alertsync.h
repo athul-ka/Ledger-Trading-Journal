@@ -26,12 +26,32 @@ inline QString piBaseUrl()
     return s.value("piServerUrl").toString().trimmed().remove(QRegularExpression("/$"));
 }
 
+inline void syncSettings(QNetworkAccessManager &nam)
+{
+    const QString base = piBaseUrl();
+    if (base.isEmpty()) return;
+
+    QSettings s("Ledger", "Ledger");
+    QJsonObject obj;
+    obj["twelve_data_key"] = s.value("twelveDataKey").toString().trimmed();
+    obj["telegram_token"] = s.value("telegramToken").toString().trimmed();
+    obj["telegram_chat_id"] = s.value("telegramChatId").toString().trimmed();
+
+    QNetworkRequest req(QUrl(base + "/settings/sync"));
+    req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+    req.setHeader(QNetworkRequest::UserAgentHeader, "Ledger-App");
+    auto *reply = nam.post(req, QJsonDocument(obj).toJson(QJsonDocument::Compact));
+    QObject::connect(reply, &QNetworkReply::finished, reply, &QNetworkReply::deleteLater);
+}
+
 // Push the complete alert list to the Pi (replaces Pi's list atomically).
 // Triggered whenever the user adds or deletes an alert.
 inline void syncAll(QNetworkAccessManager &nam, const QList<PriceAlert> &alerts)
 {
     const QString base = piBaseUrl();
     if (base.isEmpty()) return;
+
+    syncSettings(nam);
 
     QJsonArray arr;
     for (const PriceAlert &a : alerts) {
