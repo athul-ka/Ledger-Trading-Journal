@@ -2,42 +2,59 @@
 Ledger Alert Server  —  runs on your Raspberry Pi 24 x 7
 =========================================================
 Keeps a local SQLite database of price alerts.
-- REST API  : Ledger Windows app syncs alerts here.
-- WebSocket : real-time price feed from Twelve Data (no API credit cost).
-- REST poll : fallback every 5 min for indices (NAS100, US30) not on free WS plan.
-- Telegram  : fires a message when NEAR or TOUCH condition is met.
+- REST API   : Ledger Windows app syncs alerts here.
+- Ingest API : bridge process submits price/heartbeat events with sequence numbers.
+- Telegram   : fires a message when NEAR or TOUCH condition is met.
 
 Environment variables (set in .env or export before running):
-  TWELVE_DATA_KEY   — free key from twelvedata.com
-  TELEGRAM_TOKEN    — bot token from @BotFather
-  TELEGRAM_CHAT_ID  — your personal chat/group ID
-  PORT              — HTTP port (default 8000)
+    TELEGRAM_TOKEN            — bot token from @BotFather
+    TELEGRAM_CHAT_ID          — your personal chat/group ID
+    INGEST_SHARED_KEY         — optional auth key for /ingest/* endpoints
+    HEARTBEAT_STALE_SECONDS   — source state changes to STALE after this many seconds
+    HEARTBEAT_OFFLINE_SECONDS — source state changes to OFFLINE after this many seconds
+    PORT                      — HTTP port (default 8000)
 """
 
 import asyncio
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal
+from zoneinfo import ZoneInfo
 
 import httpx
-import websockets
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-TWELVE_DATA_KEY  = os.getenv("TWELVE_DATA_KEY",  "")
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN",   "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TWELVE_DATA_KEY  = os.getenv("TWELVE_DATA_KEY", "").strip()
 DB_PATH          = os.path.join(os.path.dirname(__file__), "alerts.db")
 CONFIG_PATH      = Path(os.path.dirname(__file__)) / "runtime_config.json"
-REST_FALLBACK_SECONDS = max(30, int(os.getenv("REST_FALLBACK_SECONDS", "120")))
+INGEST_SHARED_KEY = os.getenv("INGEST_SHARED_KEY", "").strip()
+HEARTBEAT_STALE_SECONDS = max(5, int(os.getenv("HEARTBEAT_STALE_SECONDS", "15")))
+HEARTBEAT_OFFLINE_SECONDS = max(
+    HEARTBEAT_STALE_SECONDS + 5,
+    int(os.getenv("HEARTBEAT_OFFLINE_SECONDS", "45")),
+)
+ENABLE_TWELVE_DATA_POLL = os.getenv("ENABLE_TWELVE_DATA_POLL", "0").strip() in ("1", "true", "TRUE", "yes", "YES")
+ALERT_TIMEZONE = os.getenv("ALERT_TIMEZONE", "Europe/Berlin")
+POLL_START_HOUR = max(0, min(23, int(os.getenv("POLL_START_HOUR", "7"))))
+POLL_END_HOUR = max(1, min(24, int(os.getenv("POLL_END_HOUR", "23"))))
+POLL_INTERVAL_SECONDS = max(60, int(os.getenv("POLL_INTERVAL_SECONDS", "300")))
+MAX_DAILY_CREDITS = max(1, int(os.getenv("MAX_DAILY_CREDITS", "800")))
+CREDITS_PER_SYMBOL_REQUEST = max(1, int(os.getenv("CREDITS_PER_SYMBOL_REQUEST", "1")))
 
-# Pairs that Twelve Data does NOT stream via WebSocket on the free plan.
-# These are polled via REST every 5 minutes instead.
-INDEX_PAIRS = {"NAS100", "US100", "NASDAQ100", "US30", "DJ30", "SP500", "US500"}
+try:
+    APP_TZ = ZoneInfo(ALERT_TIMEZONE)
+except Exception:
+    APP_TZ = timezone.utc
+
+_td_round_robin_cursor = 0
 
 app = FastAPI(title="Ledger Alert Server", version="1.0")
 
@@ -66,11 +83,59 @@ def init_db():
                 notes           TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_sources (
+                source_id                   TEXT PRIMARY KEY,
+                highest_sequence            INTEGER DEFAULT 0,
+                highest_contiguous_sequence INTEGER DEFAULT 0,
+                last_event_at              TEXT,
+                last_heartbeat_at          TEXT,
+                state                      TEXT DEFAULT 'INIT',
+                updated_at                 TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_events (
+                source_id   TEXT NOT NULL,
+                sequence    INTEGER NOT NULL,
+                event_type  TEXT NOT NULL,
+                symbol      TEXT,
+                price       REAL,
+                event_time  TEXT,
+                payload_hash TEXT,
+                received_at TEXT,
+                PRIMARY KEY (source_id, sequence)
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ingest_deadletter (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_id   TEXT,
+                sequence    INTEGER,
+                reason      TEXT,
+                payload     TEXT,
+                received_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pair_prices (
+                pair TEXT PRIMARY KEY,
+                last_price REAL,
+                updated_at TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS td_credit_usage (
+                day_key TEXT PRIMARY KEY,
+                used_credits INTEGER DEFAULT 0,
+                updated_at TEXT
+            )
+        """)
         conn.commit()
 
 
 def load_runtime_config():
-    global TWELVE_DATA_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+    global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TWELVE_DATA_KEY
 
     if not CONFIG_PATH.exists():
         return
@@ -81,37 +146,28 @@ def load_runtime_config():
         print(f"[Config] Failed to read {CONFIG_PATH.name}: {exc}")
         return
 
-    TWELVE_DATA_KEY = str(config.get("twelve_data_key", TWELVE_DATA_KEY)).strip()
     TELEGRAM_TOKEN = str(config.get("telegram_token", TELEGRAM_TOKEN)).strip()
     TELEGRAM_CHAT_ID = str(config.get("telegram_chat_id", TELEGRAM_CHAT_ID)).strip()
+    TWELVE_DATA_KEY = str(config.get("twelve_data_key", TWELVE_DATA_KEY)).strip()
     print("[Config] Loaded runtime settings")
 
 
-def save_runtime_config(twelve_data_key: str, telegram_token: str, telegram_chat_id: str):
+def save_runtime_config(telegram_token: str, telegram_chat_id: str, twelve_data_key: str):
     config = {
-        "twelve_data_key": twelve_data_key.strip(),
         "telegram_token": telegram_token.strip(),
         "telegram_chat_id": telegram_chat_id.strip(),
+        "twelve_data_key": twelve_data_key.strip(),
     }
     CONFIG_PATH.write_text(json.dumps(config, indent=2))
     print(f"[Config] Saved runtime settings to {CONFIG_PATH.name}")
 
 
-# ── Symbol helpers ────────────────────────────────────────────────────────────
-
-# Map Ledger pair name → Twelve Data symbol
 SYMBOL_MAP = {
     "BTCUSD": "BTC/USD", "ETHUSD": "ETH/USD",
     "XAUUSD": "XAU/USD", "XAGUSD": "XAG/USD",
     "NAS100": "IXIC",    "US100":  "IXIC",  "NASDAQ100": "IXIC",
     "US30":   "DJI",     "DJ30":   "DJI",
     "SP500":  "SPX",     "US500":  "SPX",
-}
-
-# Map Twelve Data WS symbol → Ledger pair (for reverse lookup)
-REVERSE_MAP = {
-    "BTC/USD": "BTCUSD", "ETH/USD": "ETHUSD",
-    "XAU/USD": "XAUUSD", "XAG/USD": "XAGUSD",
 }
 
 
@@ -122,12 +178,6 @@ def to_td(pair: str) -> str:
     if len(p) == 6:
         return p[:3] + "/" + p[3:]
     return p
-
-
-def from_td(symbol: str) -> str:
-    if symbol in REVERSE_MAP:
-        return REVERSE_MAP[symbol]
-    return symbol.replace("/", "")  # EUR/USD → EURUSD
 
 
 PIP_SIZES: dict[str, float] = {
@@ -172,7 +222,33 @@ async def send_telegram(message: str):
 
 # ── Alert evaluation ──────────────────────────────────────────────────────────
 
-async def evaluate_alerts(pair: str, price: float):
+def get_last_price(pair: str) -> float | None:
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT last_price FROM pair_prices WHERE pair = ?",
+            (pair.upper(),),
+        ).fetchone()
+    if not row:
+        return None
+    return float(row["last_price"]) if row["last_price"] is not None else None
+
+
+def set_last_price(pair: str, price: float):
+    with db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO pair_prices (pair, last_price, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(pair) DO UPDATE SET
+                last_price = excluded.last_price,
+                updated_at = excluded.updated_at
+            """,
+            (pair.upper(), price, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+
+
+async def evaluate_alerts(pair: str, price: float, previous_price: float | None = None):
     """Check all active alerts for this pair and fire Telegram if condition met."""
     pair = pair.upper()
     ps   = pip_size(pair)
@@ -188,18 +264,20 @@ async def evaluate_alerts(pair: str, price: float):
             near_pips = row["near_pips"]
             atype     = row["alert_type"]
             dist_pips = abs(price - target) / ps
+            crossed = previous_price is not None and ((previous_price - target) * (price - target) <= 0)
 
-            # ── TOUCH: within 1 pip ─────────────────────────────────────────
-            if (dist_pips <= 1.0
+            # ── CROSSED/TOUCH: level crossed between polls or current price very close ─
+            if ((crossed or dist_pips <= 1.0)
                     and not row["touch_triggered"]
                     and atype in ("TOUCH", "BOTH")):
-                print(f"[Alert] TOUCH {pair} target={target} price={price} dist={dist_pips:.2f}p")
+                label = "CROSSED" if crossed and dist_pips > 1.0 else "TOUCH"
+                print(f"[Alert] {label} {pair} target={target} price={price} dist={dist_pips:.2f}p")
                 conn.execute(
                     "UPDATE alerts SET touch_triggered = 1 WHERE id = ?", (row["id"],)
                 )
                 conn.commit()
                 msg = (
-                    f"🎯 <b>TOUCH ALERT — {pair}</b>\n"
+                    f"🎯 <b>{label} ALERT — {pair}</b>\n"
                     f"Your level : <b>{target}</b>\n"
                     f"Price now  : {price}\n"
                     f"Time       : {now}\n"
@@ -226,135 +304,260 @@ async def evaluate_alerts(pair: str, price: float):
                 )
                 asyncio.create_task(send_telegram(msg))
 
+    set_last_price(pair, price)
 
-# ── WebSocket price worker (real-time, no credit cost) ───────────────────────
 
-async def ws_price_worker():
-    """
-    Connects to Twelve Data WebSocket and subscribes to all forex/metals/crypto
-    pairs that have active alerts.  Reconnects automatically on any error.
-    """
+def in_poll_window_local(now_local: datetime) -> bool:
+    if POLL_START_HOUR < POLL_END_HOUR:
+        return POLL_START_HOUR <= now_local.hour < POLL_END_HOUR
+    return now_local.hour >= POLL_START_HOUR or now_local.hour < POLL_END_HOUR
+
+
+def day_key_local(now_local: datetime) -> str:
+    return now_local.strftime("%Y-%m-%d")
+
+
+def get_used_credits(day_key: str) -> int:
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT used_credits FROM td_credit_usage WHERE day_key = ?",
+            (day_key,),
+        ).fetchone()
+    return int(row["used_credits"]) if row else 0
+
+
+def add_used_credits(day_key: str, credits: int):
+    with db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO td_credit_usage (day_key, used_credits, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(day_key) DO UPDATE SET
+                used_credits = td_credit_usage.used_credits + excluded.used_credits,
+                updated_at = excluded.updated_at
+            """,
+            (day_key, credits, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.commit()
+
+
+def active_pairs() -> list[str]:
+    with db_conn() as conn:
+        rows = conn.execute(
+            "SELECT DISTINCT pair FROM alerts WHERE active = 1 ORDER BY pair ASC"
+        ).fetchall()
+    return [r["pair"].upper() for r in rows]
+
+
+def credits_left_today(now_local: datetime) -> int:
+    used = get_used_credits(day_key_local(now_local))
+    return max(0, MAX_DAILY_CREDITS - used)
+
+
+def remaining_window_cycles(now_local: datetime) -> int:
+    if not in_poll_window_local(now_local):
+        return 0
+    end_hour_mod = POLL_END_HOUR % 24
+    end_dt = now_local.replace(hour=end_hour_mod, minute=0, second=0, microsecond=0)
+    if POLL_START_HOUR >= POLL_END_HOUR and now_local.hour >= POLL_START_HOUR:
+        end_dt = end_dt + timedelta(days=1)
+    remaining = max(0, int((end_dt - now_local).total_seconds()))
+    return max(1, remaining // POLL_INTERVAL_SECONDS)
+
+
+async def poll_twelve_data_pairs(pairs: list[str], now_local: datetime):
+    if not pairs or not TWELVE_DATA_KEY:
+        return
+
+    symbols = ",".join(to_td(p) for p in pairs)
+    url = f"https://api.twelvedata.com/price?symbol={symbols}&apikey={TWELVE_DATA_KEY}"
+
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            resp = await client.get(url)
+            data = resp.json()
+    except Exception as exc:
+        print(f"[TD] Poll error: {exc}")
+        return
+
+    for pair in pairs:
+        sym = to_td(pair)
+        price = None
+        if isinstance(data, dict) and sym in data and isinstance(data[sym], dict) and "price" in data[sym]:
+            price = float(data[sym]["price"])
+        elif isinstance(data, dict) and len(pairs) == 1 and "price" in data:
+            price = float(data["price"])
+
+        if price and price > 0:
+            prev = get_last_price(pair)
+            await evaluate_alerts(pair, price, prev)
+
+    add_used_credits(day_key_local(now_local), len(pairs) * CREDITS_PER_SYMBOL_REQUEST)
+
+
+def choose_pairs_for_cycle(all_pairs: list[str], now_local: datetime) -> list[str]:
+    global _td_round_robin_cursor
+    if not all_pairs:
+        return []
+
+    credits_left = credits_left_today(now_local)
+    if credits_left <= 0:
+        return []
+
+    cycles_left = remaining_window_cycles(now_local)
+    budget_this_cycle = max(1, credits_left // max(1, cycles_left))
+    max_symbols = max(1, budget_this_cycle // CREDITS_PER_SYMBOL_REQUEST)
+    max_symbols = min(max_symbols, len(all_pairs))
+
+    start = _td_round_robin_cursor % len(all_pairs)
+    picked = [all_pairs[(start + i) % len(all_pairs)] for i in range(max_symbols)]
+    _td_round_robin_cursor = (start + max_symbols) % len(all_pairs)
+    return picked
+
+
+async def twelve_data_poll_worker():
     while True:
-        if not TWELVE_DATA_KEY:
+        now_local = datetime.now(APP_TZ)
+
+        if not ENABLE_TWELVE_DATA_POLL or not TWELVE_DATA_KEY:
             await asyncio.sleep(30)
             continue
 
-        # Collect streaming pairs (exclude indices — those use REST)
+        if not in_poll_window_local(now_local):
+            await asyncio.sleep(30)
+            continue
+
+        pairs = active_pairs()
+        cycle_pairs = choose_pairs_for_cycle(pairs, now_local)
+        if cycle_pairs:
+            await poll_twelve_data_pairs(cycle_pairs, now_local)
+            used = get_used_credits(day_key_local(now_local))
+            print(f"[TD] Polled {len(cycle_pairs)} symbols | credits used today: {used}/{MAX_DAILY_CREDITS}")
+
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def source_state_for(last_heartbeat_at: str | None) -> str:
+    if not last_heartbeat_at:
+        return "INIT"
+    try:
+        delta = datetime.now(timezone.utc) - datetime.fromisoformat(last_heartbeat_at)
+    except ValueError:
+        return "INIT"
+    seconds = delta.total_seconds()
+    if seconds >= HEARTBEAT_OFFLINE_SECONDS:
+        return "OFFLINE"
+    if seconds >= HEARTBEAT_STALE_SECONDS:
+        return "STALE"
+    return "ACTIVE"
+
+
+def ensure_source(source_id: str):
+    with db_conn() as conn:
+        conn.execute(
+            """
+            INSERT INTO ingest_sources (source_id, updated_at)
+            VALUES (?, ?)
+            ON CONFLICT(source_id) DO UPDATE SET updated_at = excluded.updated_at
+            """,
+            (source_id, now_iso()),
+        )
+        conn.commit()
+
+
+def recalc_sequences(source_id: str) -> tuple[int, int, list[int]]:
+    with db_conn() as conn:
+        row = conn.execute(
+            "SELECT highest_contiguous_sequence FROM ingest_sources WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        highest_contiguous = int(row["highest_contiguous_sequence"]) if row else 0
+
+        while True:
+            next_seq = highest_contiguous + 1
+            exists = conn.execute(
+                "SELECT 1 FROM ingest_events WHERE source_id = ? AND sequence = ?",
+                (source_id, next_seq),
+            ).fetchone()
+            if not exists:
+                break
+            highest_contiguous = next_seq
+
+        row = conn.execute(
+            "SELECT COALESCE(MAX(sequence), 0) AS max_sequence FROM ingest_events WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        highest_sequence = int(row["max_sequence"]) if row else 0
+
+        window_end = min(highest_sequence, highest_contiguous + 256)
+        missing_rows = conn.execute(
+            """
+            WITH RECURSIVE seq(x) AS (
+                SELECT ?
+                UNION ALL
+                SELECT x + 1 FROM seq WHERE x < ?
+            )
+            SELECT x AS sequence
+            FROM seq
+            WHERE x > 0
+            AND NOT EXISTS (
+                SELECT 1
+                FROM ingest_events e
+                WHERE e.source_id = ? AND e.sequence = x
+            )
+            """,
+            (highest_contiguous + 1, window_end, source_id),
+        ).fetchall()
+        missing = [int(r["sequence"]) for r in missing_rows]
+
+        hb_row = conn.execute(
+            "SELECT last_heartbeat_at FROM ingest_sources WHERE source_id = ?",
+            (source_id,),
+        ).fetchone()
+        heartbeat_at = hb_row["last_heartbeat_at"] if hb_row else None
+        state = source_state_for(heartbeat_at)
+
+        conn.execute(
+            """
+            UPDATE ingest_sources
+            SET highest_sequence = ?,
+                highest_contiguous_sequence = ?,
+                state = ?,
+                updated_at = ?
+            WHERE source_id = ?
+            """,
+            (highest_sequence, highest_contiguous, state, now_iso(), source_id),
+        )
+        conn.commit()
+
+    return highest_sequence, highest_contiguous, missing
+
+
+async def source_watchdog_worker():
+    while True:
         with db_conn() as conn:
             rows = conn.execute(
-                "SELECT DISTINCT pair FROM alerts WHERE active = 1"
+                "SELECT source_id, last_heartbeat_at FROM ingest_sources"
             ).fetchall()
-
-        ws_pairs   = [r["pair"] for r in rows if r["pair"].upper() not in INDEX_PAIRS]
-        rest_pairs = [r["pair"] for r in rows if r["pair"].upper() in INDEX_PAIRS]
-
-        # Launch REST poller for indices
-        if rest_pairs:
-            asyncio.create_task(index_rest_poller(rest_pairs))
-
-        if not ws_pairs:
-            print("[WS] No active streaming pairs yet; retrying in 30 s")
-            await asyncio.sleep(30)
-            continue
-
-        symbols = ",".join(to_td(p) for p in ws_pairs)
-        uri = f"wss://ws.twelvedata.com/v1/quotes/price?apikey={TWELVE_DATA_KEY}"
-
-        try:
-            async with websockets.connect(uri, ping_interval=20, ping_timeout=10) as ws:
-                await ws.send(json.dumps({
-                    "action": "subscribe",
-                    "params": {"symbols": symbols},
-                }))
-                print(f"[WS] Subscribed to: {symbols}")
-
-                async for raw in ws:
-                    try:
-                        data = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-
-                    if data.get("event") == "price":
-                        sym   = data.get("symbol", "")
-                        price = float(data.get("price", 0))
-                        if price > 0:
-                            await evaluate_alerts(from_td(sym), price)
-                    elif data.get("event") not in (None, "heartbeat", "subscribe-status"):
-                        print(f"[WS] Ignored event: {data}")
-
-        except Exception as exc:
-            print(f"[WS] Disconnected: {exc}  — reconnecting in 15 s …")
-            await asyncio.sleep(15)
-
-
-async def all_pairs_rest_fallback_worker():
-    """
-    Poll all active pairs at a low rate as a reliability fallback.
-    This keeps alerts working even if the websocket stream stalls.
-    """
-    if not TWELVE_DATA_KEY:
-        print("[REST-Fallback] Disabled: TWELVE_DATA_KEY missing")
-        return
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        while True:
-            try:
-                with db_conn() as conn:
-                    rows = conn.execute(
-                        "SELECT DISTINCT pair FROM alerts WHERE active = 1"
-                    ).fetchall()
-
-                pairs = [r["pair"] for r in rows]
-                if not pairs:
-                    await asyncio.sleep(REST_FALLBACK_SECONDS)
-                    continue
-
-                symbols = ",".join(to_td(p) for p in pairs)
-                resp = await client.get(
-                    f"https://api.twelvedata.com/price?symbol={symbols}&apikey={TWELVE_DATA_KEY}"
+            for row in rows:
+                state = source_state_for(row["last_heartbeat_at"])
+                conn.execute(
+                    "UPDATE ingest_sources SET state = ?, updated_at = ? WHERE source_id = ?",
+                    (state, now_iso(), row["source_id"]),
                 )
-                data = resp.json()
-
-                if isinstance(data, dict) and data.get("code"):
-                    print(f"[REST-Fallback] API error: {data}")
-                else:
-                    for pair in pairs:
-                        sym = to_td(pair)
-                        if sym in data and "price" in data[sym]:
-                            await evaluate_alerts(pair, float(data[sym]["price"]))
-                        elif len(pairs) == 1 and "price" in data:
-                            await evaluate_alerts(pair, float(data["price"]))
-            except Exception as exc:
-                print(f"[REST-Fallback] Error: {exc}")
-
-            await asyncio.sleep(REST_FALLBACK_SECONDS)
+            conn.commit()
+        await asyncio.sleep(5)
 
 
-# ── REST poller for indices (not available on free WS plan) ──────────────────
-
-async def index_rest_poller(pairs: list[str]):
-    """Poll Twelve Data REST every 5 minutes for NAS100, US30, etc."""
-    if not TWELVE_DATA_KEY:
+def check_ingest_auth(x_ledger_key: str | None):
+    if not INGEST_SHARED_KEY:
         return
-    symbols_str = ",".join(to_td(p) for p in pairs)
-    url = (f"https://api.twelvedata.com/price"
-           f"?symbol={symbols_str}&apikey={TWELVE_DATA_KEY}")
-    async with httpx.AsyncClient(timeout=10) as client:
-        for _ in range(12):            # run for 1 hour; ws_worker restarts it
-            try:
-                resp = await client.get(url)
-                data = resp.json()
-                for pair in pairs:
-                    sym = to_td(pair)
-                    if sym in data and "price" in data[sym]:
-                        price = float(data[sym]["price"])
-                        await evaluate_alerts(pair, price)
-                    elif "price" in data:      # single-symbol response
-                        price = float(data["price"])
-                        await evaluate_alerts(pairs[0], price)
-            except Exception as exc:
-                print(f"[REST] Error: {exc}")
-            await asyncio.sleep(300)   # 5 minutes
+    if (x_ledger_key or "").strip() != INGEST_SHARED_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized ingest key")
 
 
 # ── FastAPI startup / shutdown ────────────────────────────────────────────────
@@ -363,9 +566,9 @@ async def index_rest_poller(pairs: list[str]):
 async def on_startup():
     init_db()
     load_runtime_config()
-    asyncio.create_task(ws_price_worker())
-    asyncio.create_task(all_pairs_rest_fallback_worker())
-    print(f"[Server] Ledger Alert Server started (fallback poll: {REST_FALLBACK_SECONDS}s)")
+    asyncio.create_task(source_watchdog_worker())
+    asyncio.create_task(twelve_data_poll_worker())
+    print("[Server] Ledger Alert Server started")
 
 
 # ── REST endpoints ────────────────────────────────────────────────────────────
@@ -379,14 +582,38 @@ class AlertIn(BaseModel):
 
 
 class SettingsIn(BaseModel):
-    twelve_data_key: str = ""
     telegram_token: str = ""
     telegram_chat_id: str = ""
+    twelve_data_key: str = ""
+
+
+class IngestEvent(BaseModel):
+    source_id: str = Field(min_length=1, max_length=128)
+    sequence: int = Field(ge=1)
+    event_type: Literal["price", "heartbeat"]
+    symbol: str = ""
+    bid: float | None = None
+    ask: float | None = None
+    mid: float | None = None
+    ts_ms: int | None = None
+    checksum: str = ""
+
+
+class IngestBatch(BaseModel):
+    protocol_version: int = 1
+    transport_id: str = ""
+    events: list[IngestEvent]
+
+
+class ReplayRequest(BaseModel):
+    source_id: str = Field(min_length=1, max_length=128)
+    from_sequence: int = Field(ge=1)
+    to_sequence: int = Field(ge=1)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "time": now_iso()}
 
 
 @app.get("/alerts")
@@ -465,36 +692,237 @@ def sync_alerts(alerts: list[AlertIn]):
 
 @app.post("/settings/sync")
 def sync_settings(settings: SettingsIn):
-    global TWELVE_DATA_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+    global TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TWELVE_DATA_KEY
 
-    TWELVE_DATA_KEY = settings.twelve_data_key.strip()
     TELEGRAM_TOKEN = settings.telegram_token.strip()
     TELEGRAM_CHAT_ID = settings.telegram_chat_id.strip()
-    save_runtime_config(TWELVE_DATA_KEY, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+    TWELVE_DATA_KEY = settings.twelve_data_key.strip() or TWELVE_DATA_KEY
+    save_runtime_config(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, TWELVE_DATA_KEY)
     print("[Sync] Applied remote settings from app")
     return {
         "synced": True,
-        "has_twelve_data_key": bool(TWELVE_DATA_KEY),
         "has_telegram_token": bool(TELEGRAM_TOKEN),
         "has_telegram_chat_id": bool(TELEGRAM_CHAT_ID),
+        "has_twelve_data_key": bool(TWELVE_DATA_KEY),
     }
 
 
-@app.get("/prices")
-async def current_prices():
-    """Fetch current prices for all watched pairs on demand."""
-    if not TWELVE_DATA_KEY:
-        return {"error": "TWELVE_DATA_KEY not set"}
+@app.post("/ingest/events")
+async def ingest_events(batch: IngestBatch, x_ledger_key: str | None = Header(default=None)):
+    """
+    Ingests ordered events from one or more sources.
+    Uses source_id + sequence as idempotency key.
+    """
+    check_ingest_auth(x_ledger_key)
+
+    if batch.protocol_version != 1:
+        raise HTTPException(status_code=400, detail="Unsupported protocol_version")
+
+    accepted = 0
+    duplicates = 0
+    rejected = 0
+    source_ids: set[str] = set()
+
+    with db_conn() as conn:
+        for event in batch.events:
+            source_ids.add(event.source_id)
+            ensure_source(event.source_id)
+
+            if event.event_type == "price" and not event.symbol.strip():
+                rejected += 1
+                conn.execute(
+                    """
+                    INSERT INTO ingest_deadletter (source_id, sequence, reason, payload, received_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (event.source_id, event.sequence, "missing-symbol", event.model_dump_json(), now_iso()),
+                )
+                continue
+
+            price = event.mid
+            if price is None and event.bid is not None and event.ask is not None:
+                price = (event.bid + event.ask) / 2.0
+            if price is None and event.bid is not None:
+                price = event.bid
+            if price is None and event.ask is not None:
+                price = event.ask
+
+            if event.event_type == "price" and (price is None or price <= 0):
+                rejected += 1
+                conn.execute(
+                    """
+                    INSERT INTO ingest_deadletter (source_id, sequence, reason, payload, received_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (event.source_id, event.sequence, "invalid-price", event.model_dump_json(), now_iso()),
+                )
+                continue
+
+            payload_hash = event.checksum.strip() or f"{event.source_id}:{event.sequence}:{event.event_type}"
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO ingest_events (
+                        source_id, sequence, event_type, symbol, price, event_time, payload_hash, received_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.source_id,
+                        event.sequence,
+                        event.event_type,
+                        event.symbol.upper().strip() if event.symbol else None,
+                        price,
+                        str(event.ts_ms) if event.ts_ms else None,
+                        payload_hash,
+                        now_iso(),
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                duplicates += 1
+                continue
+
+            accepted += 1
+            if event.event_type == "heartbeat":
+                conn.execute(
+                    """
+                    UPDATE ingest_sources
+                    SET last_heartbeat_at = ?,
+                        last_event_at = ?,
+                        state = 'ACTIVE',
+                        updated_at = ?
+                    WHERE source_id = ?
+                    """,
+                    (now_iso(), now_iso(), now_iso(), event.source_id),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE ingest_sources
+                    SET last_event_at = ?,
+                        updated_at = ?
+                    WHERE source_id = ?
+                    """,
+                    (now_iso(), now_iso(), event.source_id),
+                )
+
+        conn.commit()
+
+    source_acks = {}
+    for source_id in source_ids:
+        highest_sequence, highest_contiguous, missing = recalc_sequences(source_id)
+        source_acks[source_id] = {
+            "highest_sequence": highest_sequence,
+            "highest_contiguous_sequence": highest_contiguous,
+            "missing_sequences": missing,
+        }
+
+    for event in batch.events:
+        if event.event_type != "price":
+            continue
+        pair = event.symbol.upper().strip()
+        price = event.mid
+        if price is None and event.bid is not None and event.ask is not None:
+            price = (event.bid + event.ask) / 2.0
+        if price is None and event.bid is not None:
+            price = event.bid
+        if price is None and event.ask is not None:
+            price = event.ask
+        if pair and price and price > 0:
+            await evaluate_alerts(pair, price)
+
+    return {
+        "protocol_version": 1,
+        "accepted": accepted,
+        "duplicates": duplicates,
+        "rejected": rejected,
+        "sources": source_acks,
+        "server_time": now_iso(),
+    }
+
+
+@app.post("/ingest/replay-request")
+def replay_request(req: ReplayRequest, x_ledger_key: str | None = Header(default=None)):
+    check_ingest_auth(x_ledger_key)
+    if req.to_sequence < req.from_sequence:
+        raise HTTPException(status_code=400, detail="to_sequence must be >= from_sequence")
+
+    max_span = 2000
+    to_seq = min(req.to_sequence, req.from_sequence + max_span - 1)
+
+    with db_conn() as conn:
+        existing_rows = conn.execute(
+            """
+            SELECT sequence
+            FROM ingest_events
+            WHERE source_id = ? AND sequence BETWEEN ? AND ?
+            """,
+            (req.source_id, req.from_sequence, to_seq),
+        ).fetchall()
+        existing = {int(r["sequence"]) for r in existing_rows}
+
+    missing = [s for s in range(req.from_sequence, to_seq + 1) if s not in existing]
+    highest_sequence, highest_contiguous, _ = recalc_sequences(req.source_id)
+    return {
+        "source_id": req.source_id,
+        "from_sequence": req.from_sequence,
+        "to_sequence": to_seq,
+        "missing_sequences": missing,
+        "highest_sequence": highest_sequence,
+        "highest_contiguous_sequence": highest_contiguous,
+        "server_time": now_iso(),
+    }
+
+
+@app.get("/ingest/status")
+def ingest_status():
     with db_conn() as conn:
         rows = conn.execute(
-            "SELECT DISTINCT pair FROM alerts WHERE active = 1"
+            """
+            SELECT source_id, highest_sequence, highest_contiguous_sequence,
+                   last_event_at, last_heartbeat_at, state, updated_at
+            FROM ingest_sources
+            ORDER BY source_id ASC
+            """
         ).fetchall()
-    pairs = [r["pair"] for r in rows]
-    if not pairs:
-        return {}
-    symbols = ",".join(to_td(p) for p in pairs)
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"https://api.twelvedata.com/price?symbol={symbols}&apikey={TWELVE_DATA_KEY}"
+
+    out = []
+    for row in rows:
+        state = source_state_for(row["last_heartbeat_at"])
+        out.append(
+            {
+                "source_id": row["source_id"],
+                "state": state,
+                "highest_sequence": row["highest_sequence"],
+                "highest_contiguous_sequence": row["highest_contiguous_sequence"],
+                "last_event_at": row["last_event_at"],
+                "last_heartbeat_at": row["last_heartbeat_at"],
+                "updated_at": row["updated_at"],
+            }
         )
-    return resp.json()
+
+    return {
+        "stale_after_seconds": HEARTBEAT_STALE_SECONDS,
+        "offline_after_seconds": HEARTBEAT_OFFLINE_SECONDS,
+        "sources": out,
+        "server_time": now_iso(),
+    }
+
+
+@app.get("/twelvedata/status")
+def twelvedata_status():
+    now_local = datetime.now(APP_TZ)
+    day = day_key_local(now_local)
+    used = get_used_credits(day)
+    return {
+        "enabled": ENABLE_TWELVE_DATA_POLL,
+        "has_key": bool(TWELVE_DATA_KEY),
+        "timezone": str(ALERT_TIMEZONE),
+        "window": f"{POLL_START_HOUR:02d}:00-{POLL_END_HOUR:02d}:00",
+        "poll_interval_seconds": POLL_INTERVAL_SECONDS,
+        "credits_per_symbol_request": CREDITS_PER_SYMBOL_REQUEST,
+        "max_daily_credits": MAX_DAILY_CREDITS,
+        "used_today": used,
+        "remaining_today": max(0, MAX_DAILY_CREDITS - used),
+        "in_window_now": in_poll_window_local(now_local),
+        "server_time": now_iso(),
+    }
