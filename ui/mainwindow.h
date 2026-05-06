@@ -5,6 +5,7 @@
 #include "updater.h"
 #include "pricefetcher.h"
 #include "alertswidget.h"
+#include "checklistwidget.h"
 #include <QSystemTrayIcon>
 #include <QNetworkAccessManager>
 
@@ -40,6 +41,7 @@ private:
     void setupAccountsView();
     void setupExecuteView();
     void setupSettingsView();
+        void setupChecklistView();
         void setupAlertsView();
     void applyTheme(Theme::ThemeId id);
     void loadStats();
@@ -117,7 +119,8 @@ private:
     QDate selectedCalendarDate;
 
     // Price alerts
-    AlertsWidget         *m_alertsWidget   = nullptr;
+    AlertsWidget         *m_alertsWidget    = nullptr;
+    ChecklistWidget      *m_checklistWidget = nullptr;
     PriceFetcher         *m_priceFetcher   = nullptr;
     QSystemTrayIcon      *m_trayIcon       = nullptr;
     QNetworkAccessManager m_alertSyncNam;

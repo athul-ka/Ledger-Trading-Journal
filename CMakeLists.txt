@@ -26,6 +26,7 @@ add_executable(Ledger
     ui/mainwindow.cpp
     ui/addtradedialog.cpp
     ui/alertswidget.cpp
+    ui/checklistwidget.cpp
     core/pricefetcher.cpp
 )
 

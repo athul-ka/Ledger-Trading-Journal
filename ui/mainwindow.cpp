@@ -9,6 +9,7 @@
 #include "alertswidget.h"
 #include "alertsync.h"
 #include "pricefetcher.h"
+#include "checklistwidget.h"
 
 #include <QAbstractItemView>
 #include <QApplication>
@@ -324,6 +325,7 @@ void MainWindow::setupUI() {
     setupCalendarView();
     setupAccountsView();
     setupExecuteView();
+    setupChecklistView();
     setupAlertsView();
     setupSettingsView();
 
@@ -1388,6 +1390,12 @@ DailyTradeSummary MainWindow::dailySummaryForDate(const QDate &date) const
     summary.totalR = q.value(1).toDouble();
     summary.totalUsd = q.value(2).toDouble();
     return summary;
+}
+
+void MainWindow::setupChecklistView()
+{
+    m_checklistWidget = new ChecklistWidget(this);
+    viewTabs->addTab(m_checklistWidget, "Checklist");
 }
 
 void MainWindow::setupAlertsView()
