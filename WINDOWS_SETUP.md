@@ -119,6 +119,21 @@ git push --tags
 
 **That's it.** GitHub Actions automatically builds, bundles, and creates a Release. Your users see "Check for Updates" detect the new version.
 
+### Optional: One-Command Automation
+
+Use the included release helper script:
+
+```bash
+./release.sh v1.0.1 "Fix: improve trade entry validation"
+```
+
+This runs: `git add .` → `git commit` → `git tag` → `git push` → `git push tag`.
+Safety checks included:
+- Must be on `main`
+- Requires pending changes
+- Validates semver tag format (e.g., `v1.0.1`)
+- Prevents reusing existing local/remote tags
+
 ---
 
 ## 7. Troubleshooting
