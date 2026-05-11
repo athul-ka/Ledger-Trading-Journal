@@ -7,7 +7,7 @@
 #property version "1.00"
 
 input string OutputFileName = "ledger_ticks.jsonl";      // FILE_COMMON target
-input string SymbolsCSV = "EURUSD,GBPUSD,USDJPY,XAUUSD"; // Symbols to publish
+input string SymbolsCSV = "EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,EURGBP,EURJPY,EURCHF,EURCAD,EURAUD,EURNZD,GBPJPY,GBPCHF,GBPCAD,GBPAUD,GBPNZD,AUDJPY,AUDCHF,AUDCAD,AUDNZD,NZDJPY,NZDCHF,NZDCAD,CADJPY,CADCHF,CHFJPY,XAUUSD,XAGUSD,NAS100,US30,BTCUSD,ETHUSD"; // Symbols to publish
 input int    PublishEveryMs = 500;                        // Timer interval
 
 string g_symbols[];
@@ -75,7 +75,7 @@ void ParseSymbols(string csv)
     {
         string sym = StringTrim(g_symbols[i]);
         if (sym == "") continue;
-        g_symbols[writeIdx] = StringUpper(sym);
+        g_symbols[writeIdx] = StringToUpper(sym);
         writeIdx++;
     }
     ArrayResize(g_symbols, writeIdx);
