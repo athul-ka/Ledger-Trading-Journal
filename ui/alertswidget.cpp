@@ -1,5 +1,4 @@
 #include "alertswidget.h"
-#include "alertsync.h"
 #include "constants.h"
 #include "database.h"
 #include "instrumentformat.h"
@@ -80,9 +79,9 @@ AlertsWidget::AlertsWidget(QWidget *parent) : QWidget(parent)
     titleRow->addWidget(title);
     titleRow->addStretch();
 
-    m_piStatus = new QLabel("Pi: not configured", this);
-    m_piStatus->setStyleSheet("font-size: 11px; color: gray;");
-    titleRow->addWidget(m_piStatus);
+    m_feedStatus = new QLabel("Feed: initializing", this);
+    m_feedStatus->setStyleSheet("font-size: 11px; color: gray;");
+    titleRow->addWidget(m_feedStatus);
 
     outer->addLayout(titleRow);
 
@@ -111,22 +110,18 @@ AlertsWidget::AlertsWidget(QWidget *parent) : QWidget(parent)
     auto *addBtn    = new QPushButton("+ Add Alert",     this);
     auto *delBtn    = new QPushButton("Delete",          this);
     auto *resetBtn  = new QPushButton("Reset Selected",  this);
-    auto *syncBtn   = new QPushButton("⟳ Sync to Pi",   this);
     addBtn->setObjectName("PrimaryButton");
     btnRow->addWidget(addBtn);
     btnRow->addWidget(delBtn);
     btnRow->addWidget(resetBtn);
     btnRow->addStretch();
-    btnRow->addWidget(syncBtn);
     outer->addLayout(btnRow);
 
     connect(addBtn,   &QPushButton::clicked, this, &AlertsWidget::addAlert);
     connect(delBtn,   &QPushButton::clicked, this, &AlertsWidget::deleteSelected);
     connect(resetBtn, &QPushButton::clicked, this, &AlertsWidget::resetSelected);
-    connect(syncBtn,  &QPushButton::clicked, this, &AlertsWidget::syncToPi);
 
     refresh();
-    updateStatusLabel();
 }
 
 // ── Public API ────────────────────────────────────────────────────────────────
@@ -183,6 +178,20 @@ void AlertsWidget::onAlertTriggered(const PriceAlert &alert, double price, bool 
     Q_UNUSED(price)
 }
 
+void AlertsWidget::onFeedHealthChanged(const QString &status, bool isStale)
+{
+    if (!m_feedStatus) return;
+
+    m_feedStatus->setText(status);
+    if (isStale) {
+        m_feedStatus->setStyleSheet("font-size: 11px; color: #FF9800;");
+    } else if (status.contains("connected", Qt::CaseInsensitive)) {
+        m_feedStatus->setStyleSheet("font-size: 11px; color: #4CAF50;");
+    } else {
+        m_feedStatus->setStyleSheet("font-size: 11px; color: gray;");
+    }
+}
+
 // ── Slots ─────────────────────────────────────────────────────────────────────
 
 void AlertsWidget::addAlert()
@@ -212,7 +221,7 @@ void AlertsWidget::addAlert()
     });
 
     auto *typeComboDlg = new QComboBox(&dlg);
-    typeComboDlg->addItems({"BOTH", "NEAR", "TOUCH"});
+    typeComboDlg->addItems({"NEAR", "TOUCH"});
 
     auto *nearSpin = new QSpinBox(&dlg);
     nearSpin->setRange(1, 500);
@@ -253,7 +262,6 @@ void AlertsWidget::addAlert()
 
     AlertDB::insertAlert(Database::instance().getDB(), a);
     refresh();
-    AlertSync::syncAll(m_nam, m_alerts);
     emit alertsChanged();
 }
 
@@ -270,7 +278,6 @@ void AlertsWidget::deleteSelected()
 
     AlertDB::deleteAlert(Database::instance().getDB(), m_alerts[row].id);
     refresh();
-    AlertSync::syncAll(m_nam, m_alerts);
     emit alertsChanged();
 }
 
@@ -281,32 +288,7 @@ void AlertsWidget::resetSelected()
 
     AlertDB::resetTriggered(Database::instance().getDB(), m_alerts[row].id);
     refresh();
-    AlertSync::syncAll(m_nam, m_alerts);
     emit alertsChanged();
-}
-
-void AlertsWidget::syncToPi()
-{
-    const QString base = AlertSync::piBaseUrl();
-    if (base.isEmpty()) {
-        QMessageBox::information(this, "Sync to Pi",
-            "Pi Server URL is not configured.\n\n"
-            "Go to Settings → Price Alerts and enter your Raspberry Pi address.");
-        return;
-    }
-
-    AlertSync::checkHealth(m_nam, [this](bool ok, const QString &msg) {
-        if (!ok) {
-            QMessageBox::warning(this, "Pi Unreachable",
-                QString("Could not reach Pi server:\n%1\n\n"
-                        "Check the URL in Settings and ensure the Pi is running.").arg(msg));
-            return;
-        }
-        AlertSync::syncAll(m_nam, m_alerts);
-        m_piStatus->setText(QString("Pi: Connected ● %1 alerts synced")
-                                .arg(m_alerts.size()));
-        m_piStatus->setStyleSheet("color: #4CAF50; font-size: 11px;");
-    });
 }
 
 // ── Private helpers ───────────────────────────────────────────────────────────
@@ -338,19 +320,4 @@ void AlertsWidget::rebuildTable()
     }
 
     m_table->resizeColumnsToContents();
-}
-
-void AlertsWidget::updateStatusLabel()
-{
-    AlertSync::checkHealth(m_nam, [this](bool ok, const QString &msg) {
-        if (ok) {
-            m_piStatus->setText("Pi: Connected ●");
-            m_piStatus->setStyleSheet("color: #4CAF50; font-size: 11px;");
-        } else {
-            const QString url = AlertSync::piBaseUrl();
-            m_piStatus->setText(url.isEmpty() ? "Pi: not configured"
-                                              : QString("Pi: offline (%1)").arg(msg));
-            m_piStatus->setStyleSheet("color: gray; font-size: 11px;");
-        }
-    });
 }

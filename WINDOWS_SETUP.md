@@ -181,3 +181,13 @@ Safety checks included:
 - If you want private releases, use private GitHub repos (requires PAT token in workflow)
 - PowerShell scripts run with your user privileges — ensure the updater code is trusted
 
+---
+
+## MT5 Local Feed Alerts (No Pi, No API Limits)
+
+For local live-price alerting from MT5 directly on your Windows machine, follow:
+
+- [MT5_LOCAL_FEED_SETUP.md](MT5_LOCAL_FEED_SETUP.md)
+
+This setup uses `bridge/MT5PriceExporter.mq5` + local JSONL tick file + Ledger alerts.
+

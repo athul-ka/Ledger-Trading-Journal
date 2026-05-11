@@ -30,6 +30,10 @@ add_executable(Ledger
     core/pricefetcher.cpp
 )
 
+if(WIN32)
+    set_target_properties(Ledger PROPERTIES WIN32_EXECUTABLE TRUE)
+endif()
+
 target_include_directories(Ledger PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/core
     ${CMAKE_CURRENT_SOURCE_DIR}/ui

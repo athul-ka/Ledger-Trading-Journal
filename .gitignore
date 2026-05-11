@@ -1,17 +1,18 @@
 # Build output
 /build/
-
-# CMake generated files
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
 Makefile
 compile_commands.json
 
-# Application local data
+# Application local data and runtime files
 *.db
 *.sqlite
 *.sqlite3
+ledger_signal.json
+ledger_ticks*.jsonl
+alert_events.log
 
 # Binaries
 Ledger
@@ -23,13 +24,28 @@ Ledger
 
 # Qt generated files
 *_autogen/
+Ledger_autogen/
 *.moc
 moc_*.cpp
 ui_*.h
 qrc_*.cpp
 
+# Python cache and virtual environments
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
 # Editor and OS files
+.vscode/
+.idea/
 *.swp
 *.swo
 *~
 .DS_Store
+*.sublime-project
+*.sublime-workspace

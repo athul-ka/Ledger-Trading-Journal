@@ -6,8 +6,8 @@
 #include "pricefetcher.h"
 #include "alertswidget.h"
 #include "checklistwidget.h"
-#include <QSystemTrayIcon>
 #include <QNetworkAccessManager>
+#include <QSystemTrayIcon>
 
 class QButtonGroup;
 class QComboBox;
@@ -64,6 +64,9 @@ private:
     void updateExecuteAccountInputs();
     void calculateExecuteLotSizes();
     void executeTradesToMt5();
+    void sendDiscordAlert(const QString &title, const QString &body);
+    void logAlertEvent(const QString &message);
+    QString alertLogPath() const;
     bool insertJournalEntryForExecution(const QString &account,
                                         const QString &pair,
                                         const QString &direction,
@@ -123,5 +126,6 @@ private:
     ChecklistWidget      *m_checklistWidget = nullptr;
     PriceFetcher         *m_priceFetcher   = nullptr;
     QSystemTrayIcon      *m_trayIcon       = nullptr;
-    QNetworkAccessManager m_alertSyncNam;
+    QNetworkAccessManager m_discordNam;
+    bool                  m_feedStaleNotified = false;
 };

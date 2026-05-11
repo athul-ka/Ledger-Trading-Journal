@@ -7,7 +7,6 @@
 #include "signalwriter.h"
 #include "theme.h"
 #include "alertswidget.h"
-#include "alertsync.h"
 #include "pricefetcher.h"
 #include "checklistwidget.h"
 
@@ -17,6 +16,7 @@
 #include <QColor>
 #include <QDate>
 #include <QDesktopServices>
+#include <QDir>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -25,8 +25,12 @@
 #include <QHeaderView>
 #include <QHBoxLayout>
 #include <QItemSelectionModel>
+#include <QJsonDocument>
+#include <QJsonObject>
 #include <QLineEdit>
 #include <QLocale>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPushButton>
 #include <QMessageBox>
 #include <QComboBox>
@@ -37,23 +41,29 @@
 #include <QGuiApplication>
 #include <QRegularExpression>
 #include <QSortFilterProxyModel>
+#include <QSpinBox>
 #include <QSqlQuery>
 #include <QSqlError>
 #include <QSqlTableModel>
+#include <QStandardPaths>
 #include <QRadioButton>
 #include <QSettings>
 #include <QSignalBlocker>
+#include <QStyle>
 #include <QTabWidget>
 #include <QTableWidget>
 #include <QTableWidgetItem>
 #include <QTableView>
 #include <QTextStream>
+#include <QTimer>
 #include <QUrl>
 #include <QVBoxLayout>
 #include <QLabel>
 #include <QWidget>
 
 #include <cmath>
+#include <functional>
+#include <memory>
 
 namespace {
 
@@ -1406,22 +1416,43 @@ void MainWindow::setupAlertsView()
     // ── System tray icon for desktop notifications ─────────────────────────
     if (QSystemTrayIcon::isSystemTrayAvailable()) {
         m_trayIcon = new QSystemTrayIcon(this);
-        m_trayIcon->setIcon(QApplication::windowIcon().isNull()
-                                ? QIcon::fromTheme("dialog-information")
-                                : QApplication::windowIcon());
+        QIcon icon = QApplication::windowIcon();
+        if (icon.isNull())
+            icon = QIcon::fromTheme("dialog-information");
+        if (icon.isNull())
+            icon = style()->standardIcon(QStyle::SP_MessageBoxInformation);
+        m_trayIcon->setIcon(icon);
         m_trayIcon->show();
     }
 
-    // ── PriceFetcher (local 60-second polling for desktop notifications) ───
+    // ── PriceFetcher (local MT5 tick-file polling for desktop notifications) ─
     m_priceFetcher = new PriceFetcher(this);
 
     connect(m_alertsWidget, &AlertsWidget::alertsChanged, this, [this]() {
         m_priceFetcher->setAlerts(m_alertsWidget->alerts());
-        AlertSync::syncAll(m_alertSyncNam, m_alertsWidget->alerts());
     });
 
     connect(m_priceFetcher, &PriceFetcher::priceUpdated,
             m_alertsWidget, &AlertsWidget::onPriceUpdated);
+
+    connect(m_priceFetcher, &PriceFetcher::feedHealthChanged,
+            m_alertsWidget, &AlertsWidget::onFeedHealthChanged);
+
+    connect(m_priceFetcher, &PriceFetcher::feedHealthChanged,
+            this, [this](const QString &status, bool isStale) {
+        if (isStale && !m_feedStaleNotified && m_trayIcon) {
+            m_trayIcon->showMessage(
+                "Price Feed Stale",
+                status,
+                QSystemTrayIcon::Warning,
+                7000);
+            QApplication::beep();
+            logAlertEvent(QString("stale-warning | %1").arg(status));
+            m_feedStaleNotified = true;
+        }
+        if (!isStale)
+            m_feedStaleNotified = false;
+    });
 
     connect(m_priceFetcher, &PriceFetcher::alertTriggered,
             this, [this](const PriceAlert &alert, double price, bool isTouch) {
@@ -1437,15 +1468,18 @@ void MainWindow::setupAlertsView()
 
         if (m_trayIcon)
             m_trayIcon->showMessage(title, body, QSystemTrayIcon::Information, 8000);
+
+        QSettings s("Ledger", "Ledger");
+        if (s.value("desktopAlertSoundEnabled", true).toBool())
+            QApplication::beep();
+
+        logAlertEvent(QString("alert-triggered | %1 | %2")
+                          .arg(title, body));
+        sendDiscordAlert(title, body);
     });
 
-    {
-        QSettings s("Ledger", "Ledger");
-        if (!s.value("twelveDataKey").toString().isEmpty()) {
-            m_priceFetcher->setAlerts(m_alertsWidget->alerts());
-            m_priceFetcher->start();
-        }
-    }
+    m_priceFetcher->setAlerts(m_alertsWidget->alerts());
+    m_priceFetcher->start();
 }
 
 void MainWindow::setupSettingsView()
@@ -1532,6 +1566,101 @@ void MainWindow::setupSettingsView()
     outerLayout->addWidget(mt5HintLabel);
     outerLayout->addLayout(mt5Row);
 
+    // ── MT5 Local Price Feed ───────────────────────────────────────────────
+    auto *feedGroupLabel = new QLabel("MT5 Local Price Feed", this);
+    feedGroupLabel->setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;");
+
+    auto *feedHintLabel = new QLabel(
+        "Use MT5PriceExporter.mq5 to write live ticks into a JSONL file. "
+        "Ledger reads this file for local price alerts with no API limits.", this);
+    feedHintLabel->setWordWrap(true);
+    feedHintLabel->setStyleSheet("color: gray; font-size: 11px;");
+
+    auto *tickPathEdit = new QLineEdit(this);
+    tickPathEdit->setPlaceholderText("e.g. C:\\Users\\You\\AppData\\Roaming\\MetaQuotes\\Terminal\\Common\\Files\\ledger_ticks.jsonl");
+
+    auto *tickBrowseBtn = new QPushButton("Browse", this);
+    tickBrowseBtn->setFixedWidth(80);
+
+    auto *pollMsSpin = new QSpinBox(this);
+    pollMsSpin->setRange(200, 5000);
+    pollMsSpin->setSingleStep(100);
+    pollMsSpin->setSuffix(" ms");
+
+    auto *staleSecSpin = new QSpinBox(this);
+    staleSecSpin->setRange(5, 300);
+    staleSecSpin->setSingleStep(1);
+    staleSecSpin->setSuffix(" s");
+
+    {
+        QSettings s("Ledger", "Ledger");
+        tickPathEdit->setText(s.value("mt5TickFilePath").toString());
+        pollMsSpin->setValue(s.value("mt5PollIntervalMs", 1000).toInt());
+        staleSecSpin->setValue(s.value("mt5StaleThresholdSec", 15).toInt());
+    }
+
+    auto *tickPathRow = new QHBoxLayout;
+    tickPathRow->addWidget(tickPathEdit);
+    tickPathRow->addWidget(tickBrowseBtn);
+
+    auto *tickPathField = new QWidget(this);
+    tickPathField->setLayout(tickPathRow);
+
+    auto *feedForm = new QFormLayout;
+    feedForm->setSpacing(8);
+    feedForm->addRow("Tick File Path", tickPathField);
+    feedForm->addRow("Poll Interval", pollMsSpin);
+    feedForm->addRow("Stale Threshold", staleSecSpin);
+
+    outerLayout->addWidget(feedGroupLabel);
+    outerLayout->addWidget(feedHintLabel);
+    outerLayout->addLayout(feedForm);
+
+    // ── Alert Notifications ────────────────────────────────────────────────
+    auto *notifGroupLabel = new QLabel("Alert Notifications", this);
+    notifGroupLabel->setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;");
+
+    auto *notifHintLabel = new QLabel(
+        "Desktop popup is always shown. Enable sound and Discord webhook for dual-channel alerts.", this);
+    notifHintLabel->setWordWrap(true);
+    notifHintLabel->setStyleSheet("color: gray; font-size: 11px;");
+
+    auto *desktopSoundCheck = new QCheckBox("Play desktop sound on alerts", this);
+    auto *discordEnabledCheck = new QCheckBox("Send Discord notifications", this);
+    auto *discordMutedCheck = new QCheckBox("Mute Discord (desktop only)", this);
+    auto *discordWebhookEdit = new QLineEdit(this);
+    auto *discordTestBtn = new QPushButton("Test Discord", this);
+    auto *openLogBtn = new QPushButton("Open Alert Log", this);
+    discordTestBtn->setFixedWidth(140);
+    openLogBtn->setFixedWidth(140);
+    discordWebhookEdit->setPlaceholderText("https://discord.com/api/webhooks/...");
+
+    {
+        QSettings s("Ledger", "Ledger");
+        desktopSoundCheck->setChecked(s.value("desktopAlertSoundEnabled", true).toBool());
+        discordEnabledCheck->setChecked(s.value("discordAlertsEnabled", true).toBool());
+        discordMutedCheck->setChecked(s.value("discordAlertsMuted", false).toBool());
+        discordWebhookEdit->setText(s.value("discordWebhookUrl").toString());
+    }
+
+    auto *discordRow = new QHBoxLayout;
+    discordRow->addWidget(discordWebhookEdit, 1);
+    discordRow->addWidget(discordTestBtn);
+    discordRow->addWidget(openLogBtn);
+    auto *discordField = new QWidget(this);
+    discordField->setLayout(discordRow);
+
+    auto *notifForm = new QFormLayout;
+    notifForm->setSpacing(8);
+    notifForm->addRow("Desktop Sound", desktopSoundCheck);
+    notifForm->addRow("Discord", discordEnabledCheck);
+    notifForm->addRow("Discord Mute", discordMutedCheck);
+    notifForm->addRow("Webhook URL", discordField);
+
+    outerLayout->addWidget(notifGroupLabel);
+    outerLayout->addWidget(notifHintLabel);
+    outerLayout->addLayout(notifForm);
+
     // ── Updates section ──────────────────────────────────────────────────────
     auto *updateGroupLabel = new QLabel("Updates", this);
     updateGroupLabel->setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;");
@@ -1553,6 +1682,87 @@ void MainWindow::setupSettingsView()
         s.setValue("mt5SignalPath", text);
     });
 
+    const auto reloadPriceFeed = [this]() {
+        if (!m_priceFetcher || !m_alertsWidget) return;
+        m_priceFetcher->setAlerts(m_alertsWidget->alerts());
+        m_priceFetcher->start();
+        m_priceFetcher->refresh();
+    };
+
+    connect(tickPathEdit, &QLineEdit::textChanged, this, [](const QString &text) {
+        QSettings s("Ledger", "Ledger");
+        s.setValue("mt5TickFilePath", text.trimmed());
+    });
+    connect(tickPathEdit, &QLineEdit::editingFinished, this, reloadPriceFeed);
+
+    connect(pollMsSpin, &QSpinBox::valueChanged, this, [](int value) {
+        QSettings s("Ledger", "Ledger");
+        s.setValue("mt5PollIntervalMs", value);
+    });
+    connect(pollMsSpin, &QSpinBox::editingFinished, this, reloadPriceFeed);
+
+    connect(staleSecSpin, &QSpinBox::valueChanged, this, [](int value) {
+        QSettings s("Ledger", "Ledger");
+        s.setValue("mt5StaleThresholdSec", value);
+    });
+    connect(staleSecSpin, &QSpinBox::editingFinished, this, reloadPriceFeed);
+
+    connect(desktopSoundCheck, &QCheckBox::toggled, this, [](bool checked) {
+        QSettings s("Ledger", "Ledger");
+        s.setValue("desktopAlertSoundEnabled", checked);
+    });
+
+    connect(discordEnabledCheck, &QCheckBox::toggled, this, [](bool checked) {
+        QSettings s("Ledger", "Ledger");
+        s.setValue("discordAlertsEnabled", checked);
+    });
+
+    connect(discordMutedCheck, &QCheckBox::toggled, this, [](bool checked) {
+        QSettings s("Ledger", "Ledger");
+        s.setValue("discordAlertsMuted", checked);
+    });
+
+    connect(discordWebhookEdit, &QLineEdit::textChanged, this, [](const QString &text) {
+        QSettings s("Ledger", "Ledger");
+        s.setValue("discordWebhookUrl", text.trimmed());
+    });
+
+    connect(discordTestBtn, &QPushButton::clicked, this, [this]() {
+        const QString title = "Ledger Discord Test";
+        const QString body = "Test message from Settings. If this arrives, webhook is configured correctly.";
+        sendDiscordAlert(title, body);
+        QMessageBox::information(this, "Discord Test", "Discord test message queued.");
+    });
+
+    connect(openLogBtn, &QPushButton::clicked, this, [this]() {
+        const QString path = alertLogPath();
+
+        if (!QFileInfo::exists(path)) {
+            QFile f(path);
+            if (f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                QTextStream ts(&f);
+                ts << QDateTime::currentDateTime().toString(Qt::ISODate)
+                   << " | alert-log-created" << "\n";
+            }
+        }
+
+        const bool opened = QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+        if (!opened) {
+            QMessageBox::warning(this, "Open Alert Log",
+                                 QString("Could not open log file:\n%1").arg(path));
+        }
+    });
+
+    connect(tickBrowseBtn, &QPushButton::clicked, this, [tickPathEdit]() {
+        const QString path = QFileDialog::getOpenFileName(
+            nullptr,
+            "Select MT5 Tick JSONL File",
+            tickPathEdit->text(),
+            "JSONL Files (*.jsonl);;Text Files (*.txt);;All Files (*)");
+        if (!path.isEmpty())
+            tickPathEdit->setText(path);
+    });
+
     connect(mt5BrowseBtn, &QPushButton::clicked, this, [mt5PathEdit]() {
         const QString path = QFileDialog::getSaveFileName(
             nullptr,
@@ -1570,79 +1780,86 @@ void MainWindow::setupSettingsView()
     outerLayout->addStretch();
 
     viewTabs->addTab(settingsPage, "Settings");
-    // ── Price Alerts & Notifications ─────────────────────────────────────────
-    auto *alertsGroupLabel = new QLabel("Price Alerts &amp; Notifications", this);
-    alertsGroupLabel->setStyleSheet("font-size: 15px; font-weight: 700; margin-top: 8px;");
-
-    auto *alertsHint = new QLabel(
-        "Enter your Raspberry Pi server address and API keys to receive "
-        "Telegram alerts even when this app is closed.", this);
-    alertsHint->setWordWrap(true);
-    alertsHint->setStyleSheet("color: gray; font-size: 11px;");
-
-    auto *piUrlEdit       = new QLineEdit(this);
-    auto *tdKeyEdit       = new QLineEdit(this);
-    auto *tgTokenEdit     = new QLineEdit(this);
-    auto *tgChatIdEdit    = new QLineEdit(this);
-
-    piUrlEdit->setPlaceholderText("http://192.168.x.x:8000");
-    tdKeyEdit->setPlaceholderText("Twelve Data API key (free at twelvedata.com)");
-    tgTokenEdit->setPlaceholderText("Telegram Bot token from @BotFather");
-    tgChatIdEdit->setPlaceholderText("Telegram Chat ID from @userinfobot");
-    tgTokenEdit->setEchoMode(QLineEdit::Password);
-
-    {
-        QSettings s("Ledger", "Ledger");
-        piUrlEdit->setText(s.value("piServerUrl").toString());
-        tdKeyEdit->setText(s.value("twelveDataKey").toString());
-        tgTokenEdit->setText(s.value("telegramToken").toString());
-        tgChatIdEdit->setText(s.value("telegramChatId").toString());
-    }
-
-    auto *alertsForm = new QFormLayout;
-    alertsForm->setSpacing(8);
-    alertsForm->addRow("Pi Server URL",       piUrlEdit);
-    alertsForm->addRow("Twelve Data Key",     tdKeyEdit);
-    alertsForm->addRow("Telegram Bot Token",  tgTokenEdit);
-    alertsForm->addRow("Telegram Chat ID",    tgChatIdEdit);
-
-    outerLayout->insertWidget(outerLayout->count() - 1, alertsGroupLabel);
-    outerLayout->insertWidget(outerLayout->count() - 1, alertsHint);
-    outerLayout->insertLayout(outerLayout->count() - 1, alertsForm);
-
-    auto saveSetting = [](const QString &key, const QString &value) {
-        QSettings s("Ledger", "Ledger");
-        s.setValue(key, value.trimmed());
-    };
-    connect(piUrlEdit,    &QLineEdit::textChanged, this, [saveSetting](const QString &v) { saveSetting("piServerUrl",    v); });
-    connect(tdKeyEdit,    &QLineEdit::textChanged, this, [saveSetting](const QString &v) { saveSetting("twelveDataKey",  v); });
-    connect(tgTokenEdit,  &QLineEdit::textChanged, this, [saveSetting](const QString &v) { saveSetting("telegramToken",  v); });
-    connect(tgChatIdEdit, &QLineEdit::textChanged, this, [saveSetting](const QString &v) { saveSetting("telegramChatId", v); });
-
-    const auto syncRemoteAlertSettings = [this]() {
-        AlertSync::syncSettings(m_alertSyncNam);
-
-        if (!m_priceFetcher || !m_alertsWidget) return;
-
-        QSettings s("Ledger", "Ledger");
-        m_priceFetcher->setAlerts(m_alertsWidget->alerts());
-        if (s.value("twelveDataKey").toString().trimmed().isEmpty()) {
-            m_priceFetcher->stop();
-            return;
-        }
-
-        m_priceFetcher->start();
-        m_priceFetcher->refresh();
-    };
-
-    connect(piUrlEdit, &QLineEdit::editingFinished, this, syncRemoteAlertSettings);
-    connect(tdKeyEdit, &QLineEdit::editingFinished, this, syncRemoteAlertSettings);
-    connect(tgTokenEdit, &QLineEdit::editingFinished, this, syncRemoteAlertSettings);
-    connect(tgChatIdEdit, &QLineEdit::editingFinished, this, syncRemoteAlertSettings);
-
     connect(themeButtonGroup, &QButtonGroup::idClicked, this, [this](int id) {
         applyTheme(static_cast<Theme::ThemeId>(id));
     });
+}
+
+void MainWindow::sendDiscordAlert(const QString &title, const QString &body)
+{
+    QSettings s("Ledger", "Ledger");
+    if (!s.value("discordAlertsEnabled", true).toBool())
+        return;
+    if (s.value("discordAlertsMuted", false).toBool())
+        return;
+
+    const QString webhookUrl = s.value("discordWebhookUrl").toString().trimmed();
+    if (webhookUrl.isEmpty())
+        return;
+
+    const QString content = QString("**%1**\n%2").arg(title, body);
+    const QByteArray payload = QJsonDocument(QJsonObject{{"content", content}})
+                                   .toJson(QJsonDocument::Compact);
+
+    auto attempts = std::make_shared<int>(0);
+    auto sender = std::make_shared<std::function<void()>>();
+
+    *sender = [this, webhookUrl, payload, attempts, sender]() {
+        ++(*attempts);
+
+        QNetworkRequest req{QUrl(webhookUrl)};
+        req.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+        req.setHeader(QNetworkRequest::UserAgentHeader, "Ledger-App");
+
+        QNetworkReply *reply = m_discordNam.post(req, payload);
+        connect(reply, &QNetworkReply::finished, this, [this, reply, attempts, sender]() {
+            const int statusCode = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+            const bool ok = reply->error() == QNetworkReply::NoError
+                && statusCode >= 200 && statusCode < 300;
+            const QString err = reply->error() == QNetworkReply::NoError
+                ? QString()
+                : reply->errorString();
+            reply->deleteLater();
+
+            if (ok) {
+                logAlertEvent(QString("discord-delivered | attempt=%1").arg(*attempts));
+            } else {
+                logAlertEvent(QString("discord-failed | attempt=%1 | status=%2 | err=%3")
+                                  .arg(*attempts)
+                                  .arg(statusCode)
+                                  .arg(err));
+            }
+
+            if (ok || *attempts >= 3)
+                return;
+
+            const int delays[] = { 1000, 3000, 7000 };
+            QTimer::singleShot(delays[*attempts - 1], this, [sender]() {
+                (*sender)();
+            });
+        });
+    };
+
+    (*sender)();
+}
+
+QString MainWindow::alertLogPath() const
+{
+    QString dir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (dir.isEmpty())
+        dir = QDir::homePath() + "/.ledger";
+    QDir().mkpath(dir);
+    return dir + "/alert_events.log";
+}
+
+void MainWindow::logAlertEvent(const QString &message)
+{
+    QFile f(alertLogPath());
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text))
+        return;
+
+    QTextStream ts(&f);
+    ts << QDateTime::currentDateTime().toString(Qt::ISODate) << " | " << message << "\n";
 }
 
 void MainWindow::applyTheme(Theme::ThemeId id)
